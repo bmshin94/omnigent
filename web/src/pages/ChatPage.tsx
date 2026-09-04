@@ -4273,7 +4273,15 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin";
+type NativeModelPickerKind =
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "kiro"
+  | "opencode"
+  | "pi"
+  | "devin"
+  | "acp";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4433,6 +4441,9 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
+      // Generic ACP sessions carry no wrapper label; the server canonicalizes
+      // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
+      if (conv?.harness === "acp") return "acp";
       return null;
   }
 }
@@ -5023,7 +5034,8 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
-    modelPickerKind === "devin";
+    modelPickerKind === "devin" ||
+    modelPickerKind === "acp";
   const modelOptions: readonly {
     id: string;
     model?: string;
