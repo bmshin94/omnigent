@@ -1675,7 +1675,7 @@ def _build_acp_spawn_env(
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
     # Also lazy: model_catalog pulls the onboarding provider config eagerly.
-    from omnigent.models.model_catalog import acp_curated_models
+    from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
         acp_agents,
@@ -1743,11 +1743,13 @@ def _build_acp_spawn_env(
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
 
-        model = _resolve_spec_model(spec)
+        # Spec model, else the embedded/configured agent's model, else the
+        # provider's ``models["default"]`` tier — the same precedence the picker
+        # catalog resolves (see _acp_launch_model), so the launch model and the
+        # picker's default row can never disagree.
+        model = _acp_launch_model(spec)
         if model is not None and not model.startswith(("databricks-", "databricks/")):
             env["HARNESS_ACP_MODEL"] = model
-        elif agent.model:
-            env["HARNESS_ACP_MODEL"] = agent.model
     # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
     # raises a clear request-time error pointing the user at `omnigent setup`.
 

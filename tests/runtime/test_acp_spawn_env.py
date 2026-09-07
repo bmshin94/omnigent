@@ -376,6 +376,24 @@ def test_curated_model_list_forwards_launch_first(_isolate_config: Path) -> None
     assert env["HARNESS_ACP_MODEL_LIST"] == "custom-model,gpt-5.4,deepseek-v4-pro"
 
 
+def test_provider_default_model_pins_launch_model(_isolate_config: Path) -> None:
+    """An unpinned spec/agent launches on the curated ``models["default"]`` tier.
+
+    Gateway deployments curate the default tier as the launch model for ACP
+    workers exactly as pi-native's ``enabledModels`` does: when the spec and
+    the configured agent leave the model to the deployment, the provider's
+    ``models["default"]`` value becomes ``HARNESS_ACP_MODEL`` (and leads the
+    curated list) instead of falling back to config order.
+    """
+    _write_provider_config(
+        _isolate_config,
+        {"default": "deepseek-v4-pro", "flash": "deepseek-v4-flash"},
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:gemini-cli"))
+    assert env["HARNESS_ACP_MODEL"] == "deepseek-v4-pro"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "deepseek-v4-pro,deepseek-v4-flash"
+
+
 def test_curated_model_list_absent_when_nothing_curated(_isolate_config: Path) -> None:
     """No models: map anywhere → no HARNESS_ACP_MODEL_LIST (uncurated op)."""
     _write_acp_config(_isolate_config)

@@ -834,7 +834,8 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
 
     :param spec: The worker's (sub-)agent spec.
     :returns: The spec model (unless a ``databricks-`` id, which the builder
-        drops), else the embedded/configured agent's model, else ``None``.
+        drops), else the embedded/configured agent's model, else the resolved
+        provider's ``models["default"]`` tier, else ``None``.
     """
     model = getattr(spec.executor, "model", None)
     if isinstance(model, str) and model and not model.startswith(("databricks-", "databricks/")):
@@ -858,6 +859,20 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
         agent = agents[0] if agents else None
     if agent is not None and agent.model:
         return agent.model
+    # Deployment-curated default: the resolved provider's ``models["default"]``
+    # tier is the launch model when neither the spec nor the agent pins one,
+    # exactly as the gateway deployments curate for pi-native.
+    try:
+        from omnigent.runtime.workflow import _resolve_provider_for_build
+
+        entry = _resolve_provider_for_build(spec, harness_type=cast(Any, "acp"))
+        if entry is not None:
+            for family_name in entry.families:
+                default_model = entry.family_default_model(family_name)
+                if default_model:
+                    return default_model
+    except Exception:  # noqa: BLE001
+        return None
     return None
 
 
