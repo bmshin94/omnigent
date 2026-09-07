@@ -56,8 +56,14 @@ def test_resolve_harness_is_acp_false_without_override_or_spec() -> None:
 
 
 @pytest.mark.asyncio
-async def test_load_acp_model_options_returns_empty_without_agent_store() -> None:
+async def test_load_acp_model_options_returns_empty_without_agent_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """No agent store and no runtime global → no spec → empty options."""
+    # Another test in the same shard may have left a runtime-installed store
+    # behind; pin the global to None so this branch is exercised, not the
+    # ambient DB-backed store (whose agents id column rejects "agent_1").
+    monkeypatch.setattr("omnigent.runtime._globals._agent_store", None)
     conv = _conv()
     result = await orch._load_acp_model_options("conv_acp", conv, None)
     assert result == []
