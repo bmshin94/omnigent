@@ -1964,6 +1964,39 @@ def test_acp_curated_models_provider_default_leads_when_unpinned(
     )
 
 
+def test_acp_curated_models_default_alias_resolves_to_concrete_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``default:`` naming another tier resolves to the concrete model id.
+
+    Gateway deployments alias tier names (``deepseek-pro``) to model ids
+    (``deepseek-v4-pro``) and reference an alias from ``default:``. Launch
+    and picker rows must be concrete ids: the alias itself never appears as
+    launch or a list row, and the aliased tier's id stays deduplicated.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  bifrost:\n"
+        "    kind: gateway\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://gw.example.com/v1\n"
+        "      api_key: sk-openai\n"
+        "      wire_api: chat\n"
+        "      models:\n"
+        "        default: deepseek-pro\n"
+        "        deepseek-pro: deepseek-v4-pro\n"
+        "        gemma: gemma-4-31B-it\n",
+    )
+    spec = _worker_spec("acp:custom")
+    assert model_catalog.acp_curated_models(spec) == (
+        "deepseek-v4-pro",
+        "gemma-4-31B-it",
+    )
+
+
 def test_acp_curated_models_empty_without_provider_or_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

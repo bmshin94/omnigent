@@ -78,6 +78,7 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from omnigent.onboarding.provider_config import FamilyConfig
     from omnigent.onboarding.providers import ModelInfo
     from omnigent.spec.types import AgentSpec
 
@@ -870,10 +871,30 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
             for family_name in entry.families:
                 default_model = entry.family_default_model(family_name)
                 if default_model:
+                    family = entry.families.get(family_name)
+                    if family is not None:
+                        default_model = _resolve_model_tier_alias(family, default_model)
                     return default_model
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+def _resolve_model_tier_alias(family: FamilyConfig, model_id: str) -> str:
+    """Resolve a ``models:`` value naming another tier to its concrete id.
+
+    Deployments alias tier names to ids (``deepseek-pro: deepseek-v4-pro``)
+    and reference those aliases from other tiers (``default: deepseek-pro``).
+    Whatever reaches the gateway, the spawn env, and the picker must be the
+    concrete id, never the alias.
+    """
+    current = model_id
+    for _ in range(8):  # bounded: a cyclic alias map must terminate
+        alias = family.models.get(current)
+        if not isinstance(alias, str) or not alias or alias == current:
+            return current
+        current = alias
+    return model_id
 
 
 def acp_curated_models(spec: object) -> tuple[str, ...]:
@@ -882,7 +903,9 @@ def acp_curated_models(spec: object) -> tuple[str, ...]:
     The launch model first (the :func:`_acp_launch_model` selection — always
     present when a model is known, so the picker never hides the active
     model), then the union of every family ``models:`` tier map on the
-    resolved provider entry in config order, deduplicated. This is the ACP
+    resolved provider entry in config order, deduplicated. Tier values that
+    name another tier resolve to their concrete id first, so aliases never
+    leak into the list. This is the ACP
     counterpart of pi-native's curated ``extra_models``: the deployment's
     verified set, not a live vendor catalog.
 
@@ -914,7 +937,7 @@ def acp_curated_models(spec: object) -> tuple[str, ...]:
             for family_config in entry.families.values():
                 for model_id in family_config.models.values():
                     if isinstance(model_id, str) and model_id:
-                        curated.append(model_id)
+                        curated.append(_resolve_model_tier_alias(family_config, model_id))
     except Exception:  # noqa: BLE001
         return ()
     ids: list[str] = []
