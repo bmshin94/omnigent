@@ -47,7 +47,6 @@ from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.models.model_metadata import (
     ModelCapability,
