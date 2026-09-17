@@ -4274,14 +4274,7 @@ const PI_NATIVE_EFFORT_LEVELS = [
 ] as const;
 
 type NativeModelPickerKind =
-  | "claude"
-  | "codex"
-  | "cursor"
-  | "kiro"
-  | "opencode"
-  | "pi"
-  | "devin"
-  | "acp";
+  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 

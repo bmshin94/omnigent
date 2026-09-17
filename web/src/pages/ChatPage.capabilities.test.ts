@@ -101,8 +101,9 @@ describe("shouldShowModelPicker", () => {
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
-    // A label-less codex-native session still shows the picker by design
-    // (isLabelLessCodexNative), so the negative cases pin non-picker kinds.
+    // A label-less session resolves its wrapper label from the harness
+    // (nativeCodingAgentForHarness), so the negative cases pin harnesses that
+    // map to no picker family.
     expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
     expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
     expect(shouldShowModelPicker({ labels: {}, harness: null })).toBe(false);

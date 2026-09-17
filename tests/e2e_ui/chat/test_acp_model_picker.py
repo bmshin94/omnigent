@@ -118,11 +118,10 @@ def test_acp_session_renders_curated_model_picker(
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
 
-    model_btn = page.get_by_test_id("composer-config-model")
-    expect(model_btn).to_be_visible()
-    model_btn.click()
+    # The model row opens its own dropdown menu of checkbox rows.
+    page.get_by_test_id("composer-agent-edit").click()
 
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_ACP_EXPECTED_ROWS))
     for index, (model_id, label) in enumerate(_ACP_EXPECTED_ROWS):
         row = rows.nth(index)
@@ -147,9 +146,9 @@ def test_acp_session_model_override_selection_persists(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
-    page.locator('[role="option"][data-model-id="gemini-3-8-flash"]').click()
+    # Selection applies immediately (no Save step); the PATCH carries the id.
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -157,6 +156,6 @@ def test_acp_session_model_override_selection_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.locator('[role="menuitemcheckbox"][data-model-id="gemini-3-8-flash"]').click()
 
     assert patch_bodies[-1] == {"model_override": "gemini-3-8-flash"}
