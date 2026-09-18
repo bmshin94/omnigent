@@ -8,7 +8,7 @@ from tests.e2e_ui.chat.test_transcript_scroll_persistence import (
     _BOTTOM_DISTANCE,
     _SCROLL_TO_BOTTOM,
     _TURNS,
-    _seed_turns,
+    _open_seeded_pair,
 )
 
 _AT_BOTTOM_PX = 8
@@ -29,22 +29,8 @@ def _track_history_paging(page: Page) -> list[str]:
     return paging
 
 
-def _open_seeded_pair(
-    page: Page,
-    seeded_session_pair: tuple[str, str, str],
-) -> tuple[str, str, str]:
-    base_url, session_a, session_b = seeded_session_pair
-    _seed_turns(session_a, "alpha")
-    _seed_turns(session_b, "beta")
-    page.set_viewport_size({"width": 1280, "height": 600})
-    page.goto(f"{base_url}/c/{session_a}")
-    expect(page.get_by_text(f"alpha reply {_TURNS - 1}").first).to_be_visible(timeout=30_000)
-    expect(page.locator(f'a[href="/c/{session_b}"]')).to_be_visible(timeout=30_000)
-    return base_url, session_a, session_b
-
-
 def _resting_bottom_distance(page: Page) -> float | None:
-    """Bottom distance once history churn settles (no loading indicator, ~2s unchanged)."""
+    """Return the distance after ~2s without history churn, or None on timeout."""
     indicator = page.get_by_text("Loading earlier messages")
     last: float | None = None
     stable = 0
@@ -61,7 +47,7 @@ def _resting_bottom_distance(page: Page) -> float | None:
         else:
             stable = 0
         last = distance
-    return last
+    return None
 
 
 def test_opening_long_transcript_does_not_page_history(
