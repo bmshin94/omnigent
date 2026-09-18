@@ -12877,8 +12877,9 @@ def _build_spawn_env_from_spec(
     if harness == "acp":
         from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
 
-        validate_acp_model(spec, model_override)
         acp_default_model = _acp_launch_model(spec)
+        validate_acp_model(spec, acp_default_model)
+        validate_acp_model(spec, model_override)
     effective_spec = spec
     if model_override is not None:
         executor = getattr(spec, "executor", None)

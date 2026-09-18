@@ -453,16 +453,44 @@ def test_curated_provider_without_default_has_stable_launch_model(_isolate_confi
     assert env["HARNESS_ACP_MODEL_LIST"] == "model-a,model-b"
 
 
-def test_runner_applies_valid_override_before_checking_launch_model(_isolate_config: Path) -> None:
+@pytest.mark.parametrize("default_source", ["spec", "configured-agent", "embedded-agent"])
+@pytest.mark.parametrize("model_override", [None, "model-b"])
+def test_runner_rejects_unlisted_default_even_with_valid_override(
+    _isolate_config: Path,
+    default_source: str,
+    model_override: str | None,
+) -> None:
+    """A valid pick cannot hide an invalid model that clearing the override would restore."""
     from omnigent.runner.app import _build_spawn_env_from_spec
 
     _write_provider_config(_isolate_config, {"default": "model-a", "large": "model-b"})
-    spec = _make_spec(harness="acp:goose", model="old-model", provider="bifrost")
+    spec = _make_spec(
+        harness="acp:goose",
+        model="old-model" if default_source == "spec" else None,
+        provider="bifrost",
+        acp_agent=(
+            {"name": "Helper", "command": "helper --acp", "model": "old-model"}
+            if default_source == "embedded-agent"
+            else _MISSING
+        ),
+    )
+    with pytest.raises(OmnigentError, match="configured model list") as exc_info:
+        _build_spawn_env_from_spec(spec, "acp", model_override=model_override)
+    rejected_model = "gpt-5.3" if default_source == "configured-agent" else "old-model"
+    assert rejected_model in str(exc_info.value)
+
+
+def test_runner_valid_override_preserves_original_default(_isolate_config: Path) -> None:
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_provider_config(_isolate_config, {"default": "model-a", "large": "model-b"})
+    spec = _make_spec(harness="acp:goose", model="model-a", provider="bifrost")
     env = _build_spawn_env_from_spec(spec, "acp", model_override="model-b")
     assert env is not None
     assert env["HARNESS_ACP_MODEL"] == "model-b"
+    assert env["HARNESS_ACP_DEFAULT_MODEL"] == "model-a"
     assert env["HARNESS_ACP_MODEL_LIST"] == "model-a,model-b"
-    assert spec.executor.model == "old-model"
+    assert spec.executor.model == "model-a"
 
 
 def test_curated_model_list_absent_when_nothing_curated(_isolate_config: Path) -> None:

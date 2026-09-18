@@ -9000,7 +9000,7 @@ async def _create_session_from_existing_agent(
 
     if model_override is not None and agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
-        from omnigent.models.model_catalog import validate_acp_model
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
         from omnigent.runtime.workflow import _find_spec_by_name
 
         selection_spec = (
@@ -9017,6 +9017,8 @@ async def _create_session_from_existing_agent(
             selection_spec is not None
             and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
         ):
+            default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
+            await asyncio.to_thread(validate_acp_model, selection_spec, default_model)
             await asyncio.to_thread(validate_acp_model, selection_spec, model_override)
 
     # Inherit runner affinity from the parent session so the child
@@ -10300,25 +10302,17 @@ async def _load_acp_model_options(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return []
-    resolved_spec: object = spec
-    if conv.sub_agent_name:
-        # For a bundled-agent head sub-agent, curate the HEAD's executor (the
-        # harness this session actually spawns), mirroring _resolve_harness.
-        sub = next(
-            (s for s in spec.sub_agents if s.name == conv.sub_agent_name),
-            None,
-        )
-        if sub is not None:
-            from types import SimpleNamespace
-
-            resolved_spec = SimpleNamespace(executor=sub.executor)
     from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
+    from omnigent.runtime.workflow import _find_spec_by_name
 
     def resolve_options() -> list[dict[str, Any]]:
+        resolved_spec = spec
+        if conv.sub_agent_name:
+            resolved_spec = _find_spec_by_name(spec, conv.sub_agent_name) or spec
         curated = acp_curated_models(resolved_spec)
         if len(curated) < 2:
             return []
-        default_model = _acp_launch_model(cast(AgentSpec, resolved_spec))
+        default_model = _acp_launch_model(resolved_spec)
         return [
             {"id": model_id, "displayName": model_id, "isDefault": model_id == default_model}
             for model_id in curated

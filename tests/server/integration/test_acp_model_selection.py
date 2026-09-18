@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -197,6 +199,121 @@ async def test_child_session_uses_its_own_provider_catalog(client: httpx.AsyncCl
     )
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["model_override"] == _CHILD_ALTERNATE
+
+
+@pytest.mark.parametrize("root_harness", ["acp:synthetic", "claude-sdk"])
+async def test_nested_child_uses_its_own_harness_and_provider(
+    client: httpx.AsyncClient, root_harness: str
+) -> None:
+    """A grandchild's picker and PATCH policy match the recursively resolved launch spec."""
+    root_executor = {**_executor(), "config": {"harness": root_harness}}
+    files = {
+        "config.yaml": {
+            "spec_version": 1,
+            "name": "root",
+            "executor": root_executor,
+            "tools": {"agents": ["middle"]},
+        },
+        "agents/middle/config.yaml": {
+            "spec_version": 1,
+            "name": "middle",
+            "executor": root_executor,
+            "tools": {"agents": ["worker"]},
+        },
+        "agents/middle/agents/worker/config.yaml": {
+            "spec_version": 1,
+            "name": "worker",
+            "executor": {**_executor("worker"), "model": _CHILD_DEFAULT},
+        },
+    }
+    bundle = io.BytesIO()
+    with tarfile.open(fileobj=bundle, mode="w:gz") as archive:
+        for path, config in files.items():
+            content = yaml.safe_dump(config).encode()
+            info = tarfile.TarInfo(path)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    uploaded = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("nested.tar.gz", bundle.getvalue(), "application/gzip")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    root_id = uploaded.json()["session_id"]
+    agent = (await client.get(f"/v1/sessions/{root_id}/agent")).json()
+    middle = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": root_id,
+            "sub_agent_name": "middle",
+            "initial_items": [],
+        },
+    )
+    assert middle.status_code == 201, middle.text
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": middle.json()["id"],
+            "sub_agent_name": "worker",
+            "model_override": _CHILD_ALTERNATE,
+            "initial_items": [],
+        },
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["harness"] == "acp"
+    assert [option["id"] for option in snapshot["model_options"]] == [
+        _CHILD_DEFAULT,
+        _CHILD_ALTERNATE,
+    ]
+
+    rejected = await client.patch(
+        f"/v1/sessions/{session_id}", json={"model_override": _ALTERNATE, "silent": True}
+    )
+    assert rejected.status_code == 400, rejected.text
+    accepted = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"model_override": _CHILD_DEFAULT, "silent": True},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["model_override"] == _CHILD_DEFAULT
+
+
+async def test_invalid_default_rejects_create_even_with_listed_override(
+    client: httpx.AsyncClient,
+) -> None:
+    """A valid override cannot hide a default that the running session cannot restore."""
+    agent = await create_test_agent(
+        client, executor={**_executor(), "model": _UNLISTED}, include_llm=False
+    )
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "model_override": _ALTERNATE, "initial_items": []},
+    )
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("model", [_ALTERNATE, "default"])
+async def test_invalid_default_rejects_patch_without_mutating_metadata(
+    client: httpx.AsyncClient, model: str
+) -> None:
+    """Both selecting and resetting require a default inside the curated catalog."""
+    agent = await create_test_agent(
+        client, executor={**_executor(), "model": _UNLISTED}, include_llm=False
+    )
+    session_id = agent["_session_id"]
+    before = (await client.get(f"/v1/sessions/{session_id}")).json()
+    response = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"model_override": model, "title": "Must not change", "silent": True},
+    )
+    assert response.status_code == 400, response.text
+    after = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert after["model_override"] == before["model_override"]
+    assert after["title"] == before["title"]
 
 
 @pytest.mark.parametrize("provider", [None, "default-only"])

@@ -217,6 +217,10 @@ session selections cannot add models to the configured list. A default-only
 map leaves model switching unrestricted, and an unrelated global default
 provider does not change custom ACP agents.
 
+With curation enabled, a model pinned in the spec or ACP-agent configuration
+must also appear in the list. An unlisted default prevents launch even when a
+valid override is selected; clearing a selection restores the approved default.
+
 The ACP command still owns its gateway URL and authentication; this provider
 reference supplies model choices, not credentials. Configure matching provider
 definitions on the server and execution host. Select a model from the session

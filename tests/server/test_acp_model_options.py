@@ -60,6 +60,26 @@ def test_resolve_harness_is_acp_false_without_override_or_spec() -> None:
     assert orch._resolve_harness_impl_is_acp(conv, None) is False
 
 
+def test_resolve_harness_is_acp_for_nested_subagent() -> None:
+    """A nested ACP worker is detected even when its bundle root uses another harness."""
+    worker = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "acp:synthetic"}),
+    )
+    middle = AgentSpec(spec_version=1, name="middle", sub_agents=[worker])
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        sub_agents=[middle],
+    )
+    cache = MagicMock()
+    cache.load.return_value.spec = root
+    with patch("omnigent.runtime.get_agent_cache", return_value=cache):
+        assert orch._resolve_harness_impl_is_acp(_conv(sub_agent_name="worker"), MagicMock())
+
+
 @pytest.mark.asyncio
 async def test_load_acp_model_options_returns_empty_without_agent_store(
     monkeypatch: pytest.MonkeyPatch,

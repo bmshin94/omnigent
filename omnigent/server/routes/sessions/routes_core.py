@@ -2249,6 +2249,7 @@ def register_core_routes(
                     f"invalid model_override: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        if model_override is not None:
             conv_for_model = await asyncio.to_thread(
                 conversation_store.get_conversation, session_id
             )
@@ -2256,7 +2257,17 @@ def register_core_routes(
                 raise _session_not_found()
             if await asyncio.to_thread(_resolve_harness_impl_is_acp, conv_for_model, agent_store):
                 options = await _load_acp_model_options(session_id, conv_for_model, agent_store)
-                if options and model_override not in {option["id"] for option in options}:
+                if options and not any(option.get("isDefault") for option in options):
+                    raise OmnigentError(
+                        "The ACP agent's default model is not in its provider's curated models. "
+                        "Update the configured default or include it in the provider's models.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if (
+                    options
+                    and not clear_model
+                    and model_override not in {option["id"] for option in options}
+                ):
                     raise OmnigentError(
                         f"Model {model_override!r} is not in the ACP provider's curated models",
                         code=ErrorCode.INVALID_INPUT,
