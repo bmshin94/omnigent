@@ -24,7 +24,10 @@ export function nativeModelLabel(option: NativeModelLabelFields): string {
   const label = option.displayName ?? option.model ?? option.id;
   // Some provider catalogs repeat the transport id as their display name.
   // Hide its mechanical namespace while preserving real advertised labels.
-  if (label === option.displayName && label !== option.id && label !== option.model) return label;
+  const isTransportLabel = [option.id, option.model].some(
+    (id) => id != null && (label === id || label === id.slice(id.indexOf("/") + 1)),
+  );
+  if (option.displayName != null && !isTransportLabel) return label;
   for (const prefix of DISPLAY_ONLY_CATALOG_PREFIXES) {
     if (label.startsWith(prefix)) return label.slice(prefix.length);
   }
