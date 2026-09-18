@@ -47,6 +47,27 @@ describe("catalog model labels", () => {
     expect(nativeModelLabel({ id: "opus", displayName: "Opus" })).toBe("Opus");
   });
 
+  it.each(["system.ai.gpt-6-astra", "databricks-gpt-6-astra"])(
+    "hides the catalog namespace when %s is only a transport label",
+    (model) => {
+      const row = Object.freeze({ id: model, model, displayName: model, isDefault: true });
+      expect(nativeModelLabel(row)).toBe("gpt-6-astra");
+      expect(defaultModelLabel([row])).toBe("Default (gpt-6-astra)");
+      expect(formatStatusModelLabel(model, [row])).toBe("gpt-6-astra");
+      expect(row.model).toBe(model);
+    },
+  );
+
+  it("preserves a deliberate display name that contains a catalog namespace", () => {
+    expect(
+      nativeModelLabel({
+        id: "gpt-6-astra",
+        model: "system.ai.gpt-6-astra",
+        displayName: "system.ai.gpt-6-astra (managed)",
+      }),
+    ).toBe("system.ai.gpt-6-astra (managed)");
+  });
+
   it("prefers an exact catalog ID over another row's provider model", () => {
     const rows = [
       { id: "alias", model: "selected-id", displayName: "Alias target" },
