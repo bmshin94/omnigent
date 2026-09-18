@@ -896,6 +896,11 @@ class SseFileHandler(logging.Handler):
     backpressured — best-effort debug data. Content is never written: only the
     event name and whitelisted ids/dimensions, the same safe subset the ZeroBus
     table gets.
+
+    Retention is the operator's responsibility: files are appended without
+    rotation and old per-session files are never reaped, so ``<log_dir>`` grows
+    without bound until cleaned up externally. This is a debugging aid, not a
+    managed log stream.
     """
 
     # Concurrently open per-session fds; the least-recently-used is closed when
@@ -923,15 +928,24 @@ class SseFileHandler(logging.Handler):
         ``_zygote``), which leave the handler attached but kill the thread. The
         fresh fd cache drops any inherited descriptors (whose files belong to the
         parent) rather than writing to them.
+
+        The queue / fd-cache / stop-event are also passed to the worker as
+        arguments, so it operates solely on the state it was started with: a
+        concurrent revive that reassigns these attributes cannot make a still-
+        running old worker and the new one share one (non-thread-safe) fd cache.
         """
         self._queue: queue.Queue[_SseFileItem | threading.Event] = queue.Queue(
             maxsize=self._QUEUE_MAX_RECORDS
         )
-        # session_id -> fd, LRU-ordered; touched only by the writer thread.
+        # session_id -> fd, LRU-ordered; owned by the writer thread (also bound
+        # here for introspection/tests).
         self._fds: OrderedDict[str, int] = OrderedDict()
         self._stop = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name="omnigent-sse-file-log", daemon=True
+            target=self._run,
+            args=(self._queue, self._fds, self._stop),
+            name="omnigent-sse-file-log",
+            daemon=True,
         )
         self._thread.start()
 
@@ -976,62 +990,79 @@ class SseFileHandler(logging.Handler):
                 self._queue.get_nowait()
                 self._queue.put_nowait(item)
             except queue.Empty:
+                # The writer drained the queue between our full put and this get,
+                # so there is room now and this one record is dropped — acceptable
+                # for a best-effort sink shedding under overload.
                 pass
 
-    def _run(self) -> None:
+    def _run(
+        self,
+        work: queue.Queue[_SseFileItem | threading.Event],
+        fds: OrderedDict[str, int],
+        stop: threading.Event,
+    ) -> None:
+        # Operate only on the state this worker was started with (see
+        # _start_worker): never read self._queue/_fds/_stop, so a concurrent
+        # revive cannot repoint us at another worker's cache mid-run.
         try:
-            while not self._stop.is_set():
-                batch = self._collect_batch(self._FLUSH_INTERVAL_S)
+            while not stop.is_set():
+                batch = self._collect_batch(work, self._FLUSH_INTERVAL_S)
                 if batch:
-                    self._write_batch(batch)
+                    self._write_batch(fds, batch)
             # Best-effort drain of whatever is left on shutdown.
-            remaining = self._collect_batch(0.0)
+            remaining = self._collect_batch(work, 0.0)
             if remaining:
-                self._write_batch(remaining)
+                self._write_batch(fds, remaining)
         finally:
-            for fd in self._fds.values():
+            for fd in fds.values():
                 with contextlib.suppress(OSError):
                     os.close(fd)
-            self._fds.clear()
+            fds.clear()
 
-    def _collect_batch(self, wait: float) -> list[_SseFileItem | threading.Event]:
+    def _collect_batch(
+        self, work: queue.Queue[_SseFileItem | threading.Event], wait: float
+    ) -> list[_SseFileItem | threading.Event]:
         batch: list[_SseFileItem | threading.Event] = []
         try:
-            batch.append(self._queue.get(timeout=wait) if wait else self._queue.get_nowait())
+            batch.append(work.get(timeout=wait) if wait else work.get_nowait())
         except queue.Empty:
             return batch
         while len(batch) < self._BATCH_MAX_RECORDS:
             try:
-                batch.append(self._queue.get_nowait())
+                batch.append(work.get_nowait())
             except queue.Empty:
                 break
         return batch
 
-    def _fd_for(self, session_id: str) -> int | None:
+    def _fd_for(self, fds: OrderedDict[str, int], session_id: str) -> int | None:
         """Return an open append fd for *session_id* (writer thread only).
 
         Touches the LRU on reuse; on a miss, opens the session's file and evicts
         the least-recently-used fd when over the cap.
         """
-        fd = self._fds.get(session_id)
+        fd = fds.get(session_id)
         if fd is not None:
-            self._fds.move_to_end(session_id)
+            fds.move_to_end(session_id)
             return fd
         path = self._log_dir / f"{self._safe_session_id(session_id)}-sse.jsonl"
         try:
             self._log_dir.mkdir(parents=True, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        except OSError:
-            _logger.warning("SSE file sink: cannot open %s", path, exc_info=True)
+        except OSError as exc:
+            # Throttled: an unwritable log dir fails identically for every session
+            # on every batch, which would otherwise flood the process logs.
+            _diag("sse_file_open", "SSE file sink cannot open %s: %s", path, exc)
             return None
-        self._fds[session_id] = fd
-        if len(self._fds) > self._MAX_OPEN_FILES:
-            _evicted_id, evicted_fd = self._fds.popitem(last=False)
+        fds[session_id] = fd
+        if len(fds) > self._MAX_OPEN_FILES:
+            _evicted_id, evicted_fd = fds.popitem(last=False)
             with contextlib.suppress(OSError):
                 os.close(evicted_fd)
         return fd
 
-    def _write_batch(self, batch: list[_SseFileItem | threading.Event]) -> None:
+    def _write_batch(
+        self, fds: OrderedDict[str, int], batch: list[_SseFileItem | threading.Event]
+    ) -> None:
         """Group a drained batch by session and issue one write per session.
 
         A ``threading.Event`` in the batch is a :meth:`flush` barrier: pending
@@ -1042,7 +1073,7 @@ class SseFileHandler(logging.Handler):
 
         def flush_buffers() -> None:
             for session_id, buf in buffers.items():
-                fd = self._fd_for(session_id)
+                fd = self._fd_for(fds, session_id)
                 if fd is None:
                     continue
                 with contextlib.suppress(OSError):
@@ -1118,7 +1149,8 @@ AUDIT_LOGGER_NAME = "omnigent.audit_events"
 # content) as JSONL, split per session into
 # ``<data-dir>/logs/<source>/<session_id>-sse.jsonl`` (e.g.
 # ``~/.omnigent/logs/server/<session_id>-sse.jsonl``); useful for offline
-# debugging when the table is unavailable. See attach_sse_file_sink.
+# debugging when the table is unavailable. Files are not rotated or reaped —
+# operators must clean up the directory themselves. See attach_sse_file_sink.
 SSE_LOG_TO_FILE_ENV_VAR = "OMNIGENT_SSE_LOG_TO_FILE"
 _sse_file_handler: SseFileHandler | None = None
 
