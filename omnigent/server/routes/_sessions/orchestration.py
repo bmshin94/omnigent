@@ -9007,15 +9007,24 @@ async def _create_session_from_existing_agent(
         )
         from omnigent.runtime.workflow import _find_spec_by_name
 
-        selection_spec = (
-            await asyncio.to_thread(
-                agent_cache.load,
-                agent.id,
-                agent.bundle_location,
-                expand_env=agent.session_id is None,
+        try:
+            selection_spec = (
+                await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+            ).spec
+        except (KeyError, AttributeError, ValueError, ImportError, OSError):
+            if model_override is not None:
+                raise
+            # Without a selection, retain creation when the harness is unknown.
+            _logger.debug(
+                "create-time model policy: agent %r failed to load", agent.name, exc_info=True
             )
-        ).spec
-        if body.sub_agent_name:
+            selection_spec = None
+        if selection_spec is not None and body.sub_agent_name:
             selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
         if (
             selection_spec is not None
