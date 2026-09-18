@@ -70,6 +70,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
+    native_coding_agent_for_wrapper_label,
 )
 from omnigent.policies.types import (
     ElicitationRequest,
@@ -10283,6 +10284,59 @@ def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | N
     from omnigent.harness_aliases import canonicalize_harness
 
     return canonicalize_harness(_resolve_harness(conv, agent_store=agent_store)) == "acp"
+
+
+def _validate_session_model_selection(
+    conv: Conversation, model: str | None, agent_store: AgentStore
+) -> None:
+    """Validate a model mutation against the resolved harness and current provider config.
+
+    :param conv: The conversation whose model is changing.
+    :param model: Requested model id, or ``None`` to restore the configured default.
+    :param agent_store: Store for loading the conversation's bound agent spec.
+    :raises OmnigentError: If the harness cannot be resolved or its model policy rejects the pick.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    harness = canonicalize_harness(conv.harness_override)
+    if harness and harness != "acp":
+        return
+    if not harness and native_coding_agent_for_wrapper_label(
+        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    ):
+        return
+    try:
+        root_spec = _load_agent_spec_for_session(conv, agent_store)
+        selection_spec = root_spec
+        if root_spec is not None and conv.sub_agent_name:
+            selection_spec = _find_spec_by_name(root_spec, conv.sub_agent_name)
+        if root_spec is None or selection_spec is None:
+            raise OmnigentError(
+                "Cannot resolve the session's agent spec to validate model selection.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        harness = harness or canonicalize_harness(
+            selection_spec.executor.config.get("harness")
+            or root_spec.executor.config.get("harness")
+            or selection_spec.executor.type
+        )
+    except OmnigentError:
+        raise
+    except Exception as exc:
+        raise OmnigentError(
+            "Cannot load the session's agent spec to validate model selection.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    if not harness or harness == "omnigent":
+        raise OmnigentError(
+            "Cannot resolve the session's harness to validate model selection.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if harness == "acp":
+        validate_acp_model(selection_spec, _acp_launch_model(selection_spec))
+        validate_acp_model(selection_spec, model)
 
 
 async def _load_acp_model_options(

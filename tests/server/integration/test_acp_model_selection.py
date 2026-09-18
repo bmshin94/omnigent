@@ -12,7 +12,7 @@ import pytest
 import yaml
 
 from omnigent.runner.app import _build_spawn_env_from_spec
-from omnigent.runtime import get_agent_store, get_conversation_store
+from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
 from tests.server.helpers import create_test_agent
@@ -154,7 +154,7 @@ async def test_unlisted_model_patch_does_not_mutate_session_metadata(
         },
     )
     assert rejected.status_code == 400, rejected.text
-    assert "curated" in rejected.text
+    assert "configured model list" in rejected.text
     after = (await client.get(f"/v1/sessions/{session_id}")).json()
     assert after["model_override"] == _ALTERNATE
     assert after["title"] == before["title"]
@@ -403,7 +403,7 @@ async def test_provider_resolution_failure_rejects_patch_without_mutation(
     failure: str,
     model: str,
 ) -> None:
-    """After a cache loss, failed configuration reads reject selections and resets atomically."""
+    """Cached display options cannot authorize selections after provider resolution fails."""
     session_id = await _session(client)
     selected = await client.patch(
         f"/v1/sessions/{session_id}", json={"model_override": _ALTERNATE, "silent": True}
@@ -412,7 +412,7 @@ async def test_provider_resolution_failure_rejects_patch_without_mutation(
     store = get_conversation_store()
     before = store.get_conversation(session_id)
     assert before is not None
-    orchestration._model_options_cache.pop(session_id, None)
+    cached = orchestration._model_options_cache[session_id]
     expected_status = _break_provider_resolution(failure, monkeypatch, tmp_path)
 
     response = await client.patch(
@@ -430,4 +430,92 @@ async def test_provider_resolution_failure_rejects_patch_without_mutation(
     assert after.model_override == _ALTERNATE
     assert after.title == before.title
     assert after.labels == before.labels
-    assert session_id not in orchestration._model_options_cache
+    assert orchestration._model_options_cache[session_id] == cached
+
+
+@pytest.mark.parametrize(
+    ("removed", "model"),
+    [("selected", _ALTERNATE), ("default", _ALTERNATE), ("default", "default")],
+)
+async def test_cached_catalog_cannot_authorize_removed_model_or_default(
+    client: httpx.AsyncClient, tmp_path: Path, removed: str, model: str
+) -> None:
+    """PATCH checks current policy for both the requested model and the original reset default."""
+    agent = await create_test_agent(
+        client, executor={**_executor(), "model": _DEFAULT}, include_llm=False
+    )
+    session_id = agent["_session_id"]
+    original_pick = _DEFAULT if removed == "selected" else _ALTERNATE
+    selected = await client.patch(
+        f"/v1/sessions/{session_id}", json={"model_override": original_pick, "silent": True}
+    )
+    assert selected.status_code == 200, selected.text
+    cached = orchestration._model_options_cache[session_id]
+    assert {option["id"] for option in cached} == {_DEFAULT, _ALTERNATE}
+    store = get_conversation_store()
+    before = store.get_conversation(session_id)
+    assert before is not None
+    path = tmp_path / "config.yaml"
+    config = yaml.safe_load(path.read_text())
+    config["providers"]["curated"]["openai"]["models"] = (
+        {"default": _DEFAULT, "alternate": "catalog-model-replacement"}
+        if removed == "selected"
+        else {"default": "catalog-model-replacement", "alternate": _ALTERNATE}
+    )
+    path.write_text(yaml.safe_dump(config))
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={
+            "model_override": model,
+            "title": "Must not be persisted",
+            "labels": {"test.acp-removed-model": "true"},
+            "silent": True,
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "configured model list" in response.text
+    after = store.get_conversation(session_id)
+    assert after is not None
+    assert after.model_override == original_pick
+    assert after.title == before.title
+    assert after.labels == before.labels
+    assert orchestration._model_options_cache[session_id] == cached
+
+
+@pytest.mark.parametrize("model", [_DEFAULT, "default"])
+async def test_unloadable_bundle_rejects_model_patch_without_mutation(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    """An unavailable bundle must not turn an ACP session into an unrestricted harness."""
+    session_id = await _session(client)
+    selected = await client.patch(
+        f"/v1/sessions/{session_id}", json={"model_override": _ALTERNATE, "silent": True}
+    )
+    assert selected.status_code == 200, selected.text
+    cached = orchestration._model_options_cache[session_id]
+    store = get_conversation_store()
+    before = store.get_conversation(session_id)
+    assert before is not None
+
+    def fail_load(*_args: object, **_kwargs: object) -> None:
+        raise OSError("agent bundle unavailable")
+
+    monkeypatch.setattr(get_agent_cache(), "load", fail_load)
+    response = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={
+            "model_override": model,
+            "title": "Must not be persisted",
+            "labels": {"test.acp-unavailable-spec": "true"},
+            "silent": True,
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "Cannot load the session's agent spec" in response.text
+    after = store.get_conversation(session_id)
+    assert after is not None
+    assert after.model_override == _ALTERNATE
+    assert after.title == before.title
+    assert after.labels == before.labels
+    assert orchestration._model_options_cache[session_id] == cached

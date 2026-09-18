@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from omnigent.entities.conversation import Conversation
+from omnigent.errors import OmnigentError
 from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.server.routes._sessions import orchestration as orch
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
@@ -216,3 +217,93 @@ async def test_acp_picker_default_matches_runtime_reset(
     ]
     assert spawn_env is not None
     assert spawn_env["HARNESS_ACP_DEFAULT_MODEL"] == "model-b"
+
+
+@pytest.mark.parametrize(
+    ("override", "wrapper"),
+    [
+        ("claude-sdk", None),
+        ("claude-native", None),
+        ("auto", None),
+        (None, "claude-code-native-ui"),
+    ],
+)
+def test_model_validation_preserves_known_non_acp_sessions(
+    override: str | None, wrapper: str | None
+) -> None:
+    """Trusted harness metadata keeps non-ACP model changes independent of bundle availability."""
+    conv = _conv(
+        harness_override=override, labels={"omnigent.wrapper": wrapper} if wrapper else {}
+    )
+    with patch.object(
+        orch, "_load_agent_spec_for_session", side_effect=OSError("bundle unavailable")
+    ) as load:
+        orch._validate_session_model_selection(conv, "model-a", MagicMock())
+    load.assert_not_called()
+
+
+def test_acp_override_requires_spec_even_with_native_wrapper_label() -> None:
+    """The persisted harness override wins over a stale native presentation label."""
+    conv = _conv(
+        harness_override="acp:synthetic", labels={"omnigent.wrapper": "claude-code-native-ui"}
+    )
+    with (
+        patch.object(orch, "_load_agent_spec_for_session", side_effect=OSError("unavailable")),
+        pytest.raises(OmnigentError, match="Cannot load the session's agent spec"),
+    ):
+        orch._validate_session_model_selection(conv, "model-a", MagicMock())
+
+
+def test_model_validation_rejects_unknown_harness() -> None:
+    """An unknown wrapper and unavailable spec cannot opt out of model policy checks."""
+    with (
+        patch.object(orch, "_load_agent_spec_for_session", return_value=None),
+        pytest.raises(OmnigentError, match="Cannot resolve the session's agent spec"),
+    ):
+        orch._validate_session_model_selection(
+            _conv(labels={"omnigent.wrapper": "unknown-wrapper"}), "model-a", MagicMock()
+        )
+
+
+def test_model_validation_applies_inherited_acp_harness_to_nested_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A nested worker without its own harness still applies its provider's ACP catalog."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "worker": {
+                        "kind": "gateway",
+                        "openai": {
+                            "base_url": "https://gateway.example.invalid/v1",
+                            "api_key": "synthetic",
+                            "models": {"default": "model-a", "large": "model-b"},
+                        },
+                    }
+                }
+            }
+        )
+    )
+    worker = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", model="model-a", auth=ProviderAuth(name="worker")),
+    )
+    middle = AgentSpec(spec_version=1, name="middle", sub_agents=[worker])
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "acp:synthetic"}),
+        sub_agents=[middle],
+    )
+    with patch.object(orch, "_load_agent_spec_for_session", return_value=root):
+        with pytest.raises(OmnigentError, match="configured model list"):
+            orch._validate_session_model_selection(
+                _conv(sub_agent_name="worker"), "model-c", MagicMock()
+            )
+        orch._validate_session_model_selection(
+            _conv(sub_agent_name="worker"), "model-b", MagicMock()
+        )

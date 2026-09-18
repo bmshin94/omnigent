@@ -169,12 +169,11 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
-    _load_acp_model_options,
     _persist_model_change_note,
     _publish_runner_recovered_status,
-    _resolve_harness_impl_is_acp,
     _run_managed_launch,
     _spawn_archive_stop,
+    _validate_session_model_selection,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -2255,23 +2254,12 @@ def register_core_routes(
             )
             if conv_for_model is None:
                 raise _session_not_found()
-            if await asyncio.to_thread(_resolve_harness_impl_is_acp, conv_for_model, agent_store):
-                options = await _load_acp_model_options(session_id, conv_for_model, agent_store)
-                if options and not any(option.get("isDefault") for option in options):
-                    raise OmnigentError(
-                        "The ACP agent's default model is not in its provider's curated models. "
-                        "Update the configured default or include it in the provider's models.",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                if (
-                    options
-                    and not clear_model
-                    and model_override not in {option["id"] for option in options}
-                ):
-                    raise OmnigentError(
-                        f"Model {model_override!r} is not in the ACP provider's curated models",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
+            await asyncio.to_thread(
+                _validate_session_model_selection,
+                conv_for_model,
+                None if clear_model else model_override,
+                agent_store,
+            )
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
