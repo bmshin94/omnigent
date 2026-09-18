@@ -2141,3 +2141,45 @@ def test_acp_curated_models_do_not_include_agent_default(
     assert error.value.code == ErrorCode.INVALID_INPUT
     model_catalog.validate_acp_model(spec, "gpt-5.4")
     model_catalog.validate_acp_model(spec, None)
+
+
+@pytest.mark.parametrize("model", [None, "another-model"])
+def test_acp_missing_explicit_provider_is_not_unrestricted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None
+) -> None:
+    """A stale provider reference rejects both ordinary selections and resets."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="removed-provider"))
+    with pytest.raises(OmnigentError, match="no such provider") as error:
+        model_catalog.validate_acp_model(spec, model)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+    with pytest.raises(OmnigentError, match="no such provider"):
+        model_catalog._acp_launch_model(spec)
+
+
+def test_acp_provider_resolution_failure_does_not_become_empty_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed provider read preserves its cause and never advertises unrestricted models."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    failure = RuntimeError("provider configuration unavailable")
+
+    def fail_resolution(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr("omnigent.runtime.workflow._resolve_provider_for_build", fail_resolution)
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
+    with pytest.raises(OmnigentError, match="Cannot resolve ACP provider 'bifrost'") as error:
+        model_catalog.acp_curated_models(spec)
+    assert error.value.code == ErrorCode.INTERNAL_ERROR
+    assert error.value.__cause__ is failure
+    with pytest.raises(OmnigentError, match="Cannot resolve ACP provider"):
+        model_catalog._acp_launch_model(spec)
+
+    unbound = _worker_spec("acp:custom")
+    assert model_catalog.acp_curated_models(unbound) == ()
+    model_catalog.validate_acp_model(unbound, "another-model")

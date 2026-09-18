@@ -88,6 +88,24 @@ def _launch_env(session_id: str) -> dict[str, str]:
     return env
 
 
+def _break_provider_resolution(
+    failure: str, monkeypatch: pytest.MonkeyPatch, config_home: Path
+) -> int:
+    """Make a previously configured provider unavailable and return its expected HTTP error."""
+    if failure == "missing-provider":
+        path = config_home / "config.yaml"
+        config = yaml.safe_load(path.read_text())
+        del config["providers"]["curated"]
+        path.write_text(yaml.safe_dump(config))
+        return 400
+
+    def fail_resolution(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("provider configuration unavailable")
+
+    monkeypatch.setattr("omnigent.runtime.workflow._resolve_provider_for_build", fail_resolution)
+    return 500
+
+
 async def test_approved_model_patch_reaches_runner_without_changing_catalog(
     client: httpx.AsyncClient,
 ) -> None:
@@ -352,3 +370,64 @@ async def test_create_session_validates_model_override(
         env = _launch_env(session_id)
         assert env["HARNESS_ACP_MODEL"] == _ALTERNATE
         assert env["HARNESS_ACP_MODEL_LIST"].split(",") == [_DEFAULT, _ALTERNATE]
+
+
+@pytest.mark.parametrize("failure", ["missing-provider", "resolution-error"])
+@pytest.mark.parametrize("model", [None, _ALTERNATE])
+async def test_provider_resolution_failure_rejects_create_before_persistence(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+    model: str | None,
+) -> None:
+    """A failed catalog read rejects creation before storing a row, even without an override."""
+    agent = await create_test_agent(client, executor=_executor(), include_llm=False)
+    store = get_conversation_store()
+    before_ids = {conv.id for conv in store.list_conversations().data}
+    expected_status = _break_provider_resolution(failure, monkeypatch, tmp_path)
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "model_override": model, "initial_items": []},
+    )
+    assert response.status_code == expected_status, response.text
+    assert {conv.id for conv in store.list_conversations().data} == before_ids
+
+
+@pytest.mark.parametrize("failure", ["missing-provider", "resolution-error"])
+@pytest.mark.parametrize("model", [_DEFAULT, "default"])
+async def test_provider_resolution_failure_rejects_patch_without_mutation(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+    model: str,
+) -> None:
+    """After a cache loss, failed configuration reads reject selections and resets atomically."""
+    session_id = await _session(client)
+    selected = await client.patch(
+        f"/v1/sessions/{session_id}", json={"model_override": _ALTERNATE, "silent": True}
+    )
+    assert selected.status_code == 200, selected.text
+    store = get_conversation_store()
+    before = store.get_conversation(session_id)
+    assert before is not None
+    orchestration._model_options_cache.pop(session_id, None)
+    expected_status = _break_provider_resolution(failure, monkeypatch, tmp_path)
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={
+            "model_override": model,
+            "title": "Must not be persisted",
+            "labels": {"test.acp-provider-error": "true"},
+            "silent": True,
+        },
+    )
+    assert response.status_code == expected_status, response.text
+    after = store.get_conversation(session_id)
+    assert after is not None
+    assert after.model_override == _ALTERNATE
+    assert after.title == before.title
+    assert after.labels == before.labels
+    assert session_id not in orchestration._model_options_cache

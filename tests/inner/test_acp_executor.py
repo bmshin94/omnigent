@@ -20,7 +20,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -35,6 +35,7 @@ from omnigent.inner.acp_executor import (
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
     SubAgentCompleted,
@@ -2432,7 +2433,8 @@ async def test_model_override_withheld_outside_curated_list() -> None:
     ex._handle_session_update(_model_option("model-a"))
     ex._rpc = AsyncMock()  # type: ignore[assignment]
 
-    await ex._apply_model_override("s1", "model-c")
+    with pytest.raises(RuntimeError, match="configured model list"):
+        await ex._apply_model_override("s1", "model-c")
     ex._rpc.assert_not_awaited()
 
 
@@ -2453,6 +2455,107 @@ async def test_model_override_allowed_within_curated_list() -> None:
     assert calls == [
         ("session/set_config_option", {"sessionId": "s1", "configId": "model", "value": "model-b"})
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rpc-error", "no-option", "different-echo", "timeout"])
+async def test_curated_model_failure_stops_before_prompt_and_remains_retryable(
+    failure: str,
+) -> None:
+    """An unsuccessful selection must never send the turn on the previous model."""
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", available_models=("model-a", "model-b"), omnigent_mcp=False)
+    )
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._reader_task = Mock(spec=asyncio.Task)
+    ex._reader_task.done.return_value = False
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._handle_session_update(_model_option("model-a"))
+    if failure == "no-option":
+        ex._config_option_ids = {"mode"}
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    response = (
+        {"result": {"configOptions": [{"id": "model", "currentValue": "model-a"}]}}
+        if failure == "different-echo"
+        else {"error": {"message": "model unavailable"}}
+    )
+    ex._rpc = AsyncMock(  # type: ignore[assignment]
+        return_value=response,
+        side_effect=TimeoutError("switch timed out") if failure == "timeout" else None,
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in ex.run_turn(
+                [{"role": "user", "content": "hello"}], [], "", ExecutorConfig(model="model-b")
+            )
+        ]
+
+    events = await asyncio.wait_for(collect_events(), timeout=1.0)
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "ACP model selection failed" in error.message
+    assert error.retryable and error.preserve_session
+    ex._send.assert_not_awaited()
+    assert ex._session_id == "s1"
+    assert ex._model_switch_supported
+    assert ex._active_model == (None if failure == "timeout" else "model-a")
+
+    ex._config_option_ids = {"model"}
+    ex._rpc = AsyncMock(
+        return_value={
+            "result": {
+                "configOptions": [  # type: ignore[assignment]
+                    {"id": "model", "currentValue": "model-b"},
+                ]
+            }
+        }
+    )
+    await ex._apply_model_override("s1", "model-b")
+    ex._rpc.assert_awaited_once()
+    assert ex._active_model == "model-b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["process-exit", "reader-stopped", "no-reader", "broken-pipe"])
+async def test_curated_model_failure_does_not_preserve_dead_transport(failure: str) -> None:
+    """A failed transport must be torn down before another turn can create a session."""
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", available_models=("model-a", "model-b"), omnigent_mcp=False)
+    )
+    ex._proc = Mock(returncode=None)
+    ex._reader_task = Mock(spec=asyncio.Task)
+    ex._reader_task.done.return_value = failure == "reader-stopped"
+    if failure == "no-reader":
+        ex._reader_task = None
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._handle_session_update(_model_option("model-a"))
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+
+    async def fail_selection(*args, **kwargs):
+        if failure == "process-exit":
+            ex._proc.returncode = 1
+        if failure == "broken-pipe":
+            raise BrokenPipeError("ACP subprocess closed stdin")
+        raise TimeoutError("switch timed out")
+
+    ex._rpc = AsyncMock(side_effect=fail_selection)  # type: ignore[method-assign]
+    events = [
+        event
+        async for event in ex.run_turn(
+            [{"role": "user", "content": "hello"}], [], "", ExecutorConfig(model="model-b")
+        )
+    ]
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.retryable
+    assert not error.preserve_session
+    ex._send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

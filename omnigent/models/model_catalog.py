@@ -861,13 +861,10 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
             agent = agents[0] if agents else None
         if agent is not None and agent.model:
             return agent.model
-    try:
-        entry = _acp_provider_entry(spec)
-        if entry is not None:
-            return _acp_provider_default(entry) or next(iter(acp_curated_models(spec)), None)
-        return None
-    except Exception:  # noqa: BLE001
-        return None
+    entry = _acp_provider_entry(spec)
+    if entry is not None:
+        return _acp_provider_default(entry) or next(iter(acp_curated_models(spec)), None)
+    return None
 
 
 def _acp_provider_entry(spec: AgentSpec) -> ProviderEntry | None:
@@ -875,13 +872,24 @@ def _acp_provider_entry(spec: AgentSpec) -> ProviderEntry | None:
 
     :param spec: The worker's agent spec.
     :returns: The named provider, or ``None`` when the vendor owns its config.
+    :raises OmnigentError: If the explicitly selected provider cannot be resolved.
     """
+    from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.runtime.workflow import _resolve_provider_for_build
     from omnigent.spec.types import ProviderAuth
 
     if not isinstance(spec.executor.auth, ProviderAuth):
         return None
-    return _resolve_provider_for_build(spec, harness_type=cast(Any, "acp"))
+    try:
+        return _resolve_provider_for_build(spec, harness_type=cast(Any, "acp"))
+    except OmnigentError:
+        raise
+    except Exception as exc:
+        raise OmnigentError(
+            f"Cannot resolve ACP provider {spec.executor.auth.name!r}. "
+            "Check the provider configuration.",
+            code=ErrorCode.INTERNAL_ERROR,
+        ) from exc
 
 
 def _acp_provider_default(entry: ProviderEntry) -> str | None:
@@ -905,29 +913,24 @@ def acp_curated_models(spec: object) -> tuple[str, ...]:
     agent defaults never expand or reorder the deployment's configured set.
     Credentials are not consulted: the vendor CLI authenticates itself.
 
-    Total by contract: any resolution error collapses to ``()`` so spawn-env
-    and picker callers can treat an empty list as "nothing curated".
-
     :param spec: The worker's (sub-)agent spec.
     :returns: At least two distinct configured model ids, provider default
         first; empty for unbound, unconfigured, or default-only providers.
+    :raises OmnigentError: If an explicitly selected provider cannot be resolved.
     """
-    try:
-        entry = _acp_provider_entry(cast("AgentSpec", spec))
-        if entry is None:
-            return ()
-        default = _acp_provider_default(entry)
-        models = [default] if default else []
-        models.extend(
-            family.resolve_model_tier(model_id)
-            for family in entry.families.values()
-            for model_id in family.models.values()
-            if model_id
-        )
-        curated = tuple(dict.fromkeys(models))
-        return curated if len(curated) > 1 else ()
-    except Exception:  # noqa: BLE001
+    entry = _acp_provider_entry(cast("AgentSpec", spec))
+    if entry is None:
         return ()
+    default = _acp_provider_default(entry)
+    models = [default] if default else []
+    models.extend(
+        family.resolve_model_tier(model_id)
+        for family in entry.families.values()
+        for model_id in family.models.values()
+        if model_id
+    )
+    curated = tuple(dict.fromkeys(models))
+    return curated if len(curated) > 1 else ()
 
 
 def validate_acp_model(spec: object, model: str | None) -> None:
@@ -935,14 +938,12 @@ def validate_acp_model(spec: object, model: str | None) -> None:
 
     :param spec: The worker's (sub-)agent spec.
     :param model: Requested model id, or ``None`` to reset to the default.
-    :raises OmnigentError: If a curated provider does not include the model.
+    :raises OmnigentError: If the provider cannot be resolved or excludes the model.
     """
     from omnigent.errors import ErrorCode, OmnigentError
 
-    if model is None:
-        return
     curated = acp_curated_models(spec)
-    if curated and model not in curated:
+    if model is not None and curated and model not in curated:
         raise OmnigentError(
             f"Model {model!r} is not in this ACP agent's configured model list. "
             "Choose a listed model or add it to the provider's models configuration.",

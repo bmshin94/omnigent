@@ -260,6 +260,10 @@ class AcpAgentConfig:
     default_model: str | None = None
 
 
+class _AcpModelSwitchError(RuntimeError):
+    """A rejected model selection, before the ACP prompt is sent."""
+
+
 class _AcpRequestError(Exception):
     """A handler failure to return as a JSON-RPC error on a server request.
 
@@ -1584,11 +1588,9 @@ class AcpExecutor(Executor):
         the session is not recreated — so a ``/model`` pick mid-conversation keeps
         the history the agent has already built up.
 
-        No-ops when the model is unset, already active, or the agent never
-        advertised a ``model`` option. A failed attempt latches the feature off
-        for this process rather than re-requesting on every turn, and never fails
-        the turn: an agent that can't switch should still answer on the model it
-        has.
+        Curated sessions fail the turn if the requested model cannot be selected.
+        Uncurated sessions retain the fallback to the current model and disable
+        unsupported switching for this process.
 
         :param session_id: The live ACP session to reconfigure.
         :param model: Requested model id, or ``None`` to restore the configured default.
@@ -1600,19 +1602,18 @@ class AcpExecutor(Executor):
         elif not default_model:
             default_model = self._initial_model
         model = model or default_model
-        if not model or model == self._active_model or not self._model_switch_supported:
+        if not model:
             return
-        # Curated deployments only: a pick outside the verified set is withheld
-        # so the agent's own picker can't bypass the deployment's catalog.
-        # Uncurated sessions (no HARNESS_ACP_MODEL_LIST) pass everything through.
         available = getattr(self._config, "available_models", ())
         if available and model not in available:
-            logger.warning(
-                "acp[%s] model switch to %r withheld: not in the curated model list. "
-                "Add it to the provider's models: map to enable it.",
-                self._config.name,
-                model,
+            raise _AcpModelSwitchError(
+                f"Model {model!r} is not in this ACP agent's configured model list."
             )
+        if model == self._active_model:
+            return
+        if not self._model_switch_supported:
+            if available:
+                raise _AcpModelSwitchError(f"ACP agent cannot switch to model {model!r}.")
             return
         # An agent that returned a model catalog from ``session/new`` selects
         # models with ``session/set_model`` and never advertises a ``model``
@@ -1621,9 +1622,12 @@ class AcpExecutor(Executor):
         if self._session_model_ids:
             await self._set_model_via_catalog(session_id, model)
             return
-        # Before the first ``config_option_update`` we don't know what's settable;
-        # attempting is harmless because a rejection just latches the feature off.
+        # Before the first config update, the RPC response determines support.
         if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+            if available:
+                raise _AcpModelSwitchError(
+                    f"ACP agent exposes no model option for switching to {model!r}."
+                )
             self._model_switch_supported = False
             logger.info(
                 "acp[%s] agent exposes no %r config option; leaving model as-is",
@@ -1637,6 +1641,11 @@ class AcpExecutor(Executor):
             {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
         )
         if "error" in response:
+            if available:
+                raise _AcpModelSwitchError(
+                    f"ACP agent rejected model {model!r}: "
+                    f"{response['error'].get('message', response['error'])}"
+                )
             self._model_switch_supported = False
             logger.warning(
                 "acp[%s] model switch to %s rejected (%s); continuing on the current model",
@@ -1659,6 +1668,10 @@ class AcpExecutor(Executor):
         )
         if echoed_model is None:
             self._active_model = model
+        elif available and echoed_model != model:
+            raise _AcpModelSwitchError(
+                f"ACP agent selected {echoed_model!r} instead of requested model {model!r}."
+            )
         logger.info(
             "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
         )
@@ -1668,8 +1681,8 @@ class AcpExecutor(Executor):
 
         Used for agents that advertise a catalog in ``session/new`` rather than a
         ``model`` config option. Like the config-option path this preserves the
-        transcript, never fails the turn, and latches the feature off on
-        rejection.
+        transcript. A rejection fails curated turns; uncurated sessions retain
+        their current model and disable further switch attempts.
 
         The requested id is *not* checked against ``availableModels``: that list
         is what the agent offers interactively, and an id outside it can still be
@@ -1684,6 +1697,11 @@ class AcpExecutor(Executor):
             _AGENT_METHOD_SET_MODEL, {"sessionId": session_id, "modelId": model}
         )
         if "error" in response:
+            if self._config.available_models:
+                raise _AcpModelSwitchError(
+                    f"ACP agent rejected model {model!r}: "
+                    f"{response['error'].get('message', response['error'])}"
+                )
             self._model_switch_supported = False
             logger.warning(
                 "acp[%s] %s to %s rejected (%s); continuing on the current model",
@@ -1734,12 +1752,28 @@ class AcpExecutor(Executor):
             return
 
         # Apply a ``/model`` pick to the live session before prompting, so the
-        # switch takes effect on this turn with the transcript intact. Never fatal
-        # — an agent that can't switch answers on the model it already has.
+        # switch takes effect on this turn with the transcript intact.
         requested_model = config.model if config is not None else None
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001
+            if self._config.available_models:
+                if not isinstance(exc, _AcpModelSwitchError):
+                    # A transport failure leaves the actual selection uncertain.
+                    self._active_model = None
+                yield ExecutorError(
+                    message=f"ACP model selection failed: {describe_exception(exc)}. "
+                    "No prompt was sent; retry or select another configured model.",
+                    retryable=True,
+                    preserve_session=(
+                        isinstance(exc, (_AcpModelSwitchError, TimeoutError))
+                        and self._proc is not None
+                        and self._proc.returncode is None
+                        and self._reader_task is not None
+                        and not self._reader_task.done()
+                    ),
+                )
+                return
             self._model_switch_supported = False
             logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
 

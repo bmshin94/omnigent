@@ -20,7 +20,9 @@ import json
 import os
 import sys
 
-record_path, protocol = sys.argv[1:]
+record_path, protocol, *options = sys.argv[1:]
+failure = options[0] if options else ""
+failed_once = False
 model = "model-a"
 session_id = "fake-" + str(os.getpid())
 turn = 0
@@ -37,6 +39,17 @@ for line in sys.stdin:
     with open(record_path, "a") as record:
         record.write(json.dumps({"pid": os.getpid(), **request}) + "\n")
     method, params = request.get("method"), request.get("params", {})
+    if method in ("session/set_model", "session/set_config_option") and not failed_once:
+        if failure == "reject-once":
+            failed_once = True
+            send({"jsonrpc": "2.0", "id": request["id"],
+                  "error": {"code": -32000, "message": "model temporarily unavailable"}})
+            continue
+        if failure == "different-echo-once":
+            failed_once = True
+            send({"jsonrpc": "2.0", "id": request["id"],
+                  "result": {"configOptions": model_options()}})
+            continue
     if method == "initialize":
         result = {"protocolVersion": 1, "agentCapabilities": {}}
     elif method == "session/new":
@@ -75,11 +88,20 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["config", "catalog"])
+@pytest.mark.parametrize(
+    ("protocol", "failure"),
+    [
+        ("config", ""),
+        ("catalog", ""),
+        ("config", "reject-once"),
+        ("catalog", "reject-once"),
+        ("config", "different-echo-once"),
+    ],
+)
 async def test_acp_picker_switch_and_reset_preserve_process_and_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str, failure: str
 ) -> None:
-    """A launch override, another pick, and reset use one ACP session and retain its turns."""
+    """Picks, retries, and reset preserve the session without wrong-model turns."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump(
@@ -116,7 +138,7 @@ async def test_acp_picker_switch_and_reset_preserve_process_and_session(
                 "acp_agent": {
                     "name": "Fake ACP",
                     "command": shlex.join(
-                        [sys.executable, str(script), str(record_path), protocol]
+                        [sys.executable, str(script), str(record_path), protocol, failure]
                     ),
                     "send_model": True,
                     "omnigent_mcp": False,
@@ -133,7 +155,13 @@ async def test_acp_picker_switch_and_reset_preserve_process_and_session(
         first_client = None
         first_pid = None
         try:
-            for turn, override in enumerate(("model-b", "model-c", None), start=1):
+            turn = 0
+            picks = (
+                ("model-b", "model-c", "model-c", None)
+                if failure
+                else ("model-b", "model-c", None)
+            )
+            for attempt, override in enumerate(picks, start=1):
                 env = _build_spawn_env_from_spec(spec, "acp", model_override=override)
                 client = await manager.get_client("conv_acp_switch", "acp", env=env)
                 pid = manager._entries["conv_acp_switch"].process.pid
@@ -147,11 +175,19 @@ async def test_acp_picker_switch_and_reset_preserve_process_and_session(
                         "type": "message",
                         "role": "user",
                         "model": "test-acp",
-                        "content": f"Turn {turn}",
+                        "content": f"Attempt {attempt}",
                         "model_override": override,
                     },
                 )
                 response.raise_for_status()
+                if failure and attempt == 2:
+                    assert "event: response.failed" in response.text
+                    assert "ACP model selection failed" in response.text
+                    assert "No prompt was sent" in response.text
+                    requests = [json.loads(line) for line in record_path.read_text().splitlines()]
+                    assert sum(r.get("method") == "session/prompt" for r in requests) == 1
+                    continue
+                turn += 1
                 assert "event: response.completed" in response.text
                 assert f"turn={turn};model={override or 'model-a'}" in response.text
         finally:
@@ -167,5 +203,7 @@ async def test_acp_picker_switch_and_reset_preserve_process_and_session(
         request["params"] for request in requests if request.get("method") == switch_method
     ]
     model_field = "modelId" if protocol == "catalog" else "value"
-    assert [switch[model_field] for switch in switches] == ["model-c", "model-a"]
+    expected_switches = ["model-c", "model-c", "model-a"] if failure else ["model-c", "model-a"]
+    assert [switch[model_field] for switch in switches] == expected_switches
     assert len({switch["sessionId"] for switch in switches}) == 1
+    assert sum(r.get("method") == "session/prompt" for r in requests) == 3

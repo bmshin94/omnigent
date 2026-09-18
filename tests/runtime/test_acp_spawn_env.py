@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.workflow import _build_acp_spawn_env
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig, ProviderAuth
 
@@ -491,6 +491,37 @@ def test_runner_valid_override_preserves_original_default(_isolate_config: Path)
     assert env["HARNESS_ACP_DEFAULT_MODEL"] == "model-a"
     assert env["HARNESS_ACP_MODEL_LIST"] == "model-a,model-b"
     assert spec.executor.model == "model-a"
+
+
+@pytest.mark.parametrize("failure", ["missing-provider", "resolution-error"])
+@pytest.mark.parametrize("model_override", [None, "model-b"])
+def test_runner_rejects_failed_explicit_provider_resolution(
+    _isolate_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    model_override: str | None,
+) -> None:
+    """Neither a pinned model nor an override permits launch without resolving its policy."""
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_acp_config(_isolate_config)
+    if failure == "resolution-error":
+
+        def fail_resolution(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("provider configuration unavailable")
+
+        monkeypatch.setattr(
+            "omnigent.runtime.workflow._resolve_provider_for_build", fail_resolution
+        )
+    spec = _make_spec(harness="acp:goose", model="model-a", provider="bifrost")
+    expected_code = (
+        ErrorCode.INVALID_INPUT if failure == "missing-provider" else ErrorCode.INTERNAL_ERROR
+    )
+    with pytest.raises(OmnigentError) as error:
+        _build_spawn_env_from_spec(spec, "acp", model_override=model_override)
+    assert error.value.code == expected_code
+    with pytest.raises(OmnigentError):
+        _build_acp_spawn_env(spec)
 
 
 def test_curated_model_list_absent_when_nothing_curated(_isolate_config: Path) -> None:
