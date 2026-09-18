@@ -2472,3 +2472,44 @@ async def test_model_override_uncurated_sessions_are_ungated() -> None:
     assert calls == [
         ("session/set_config_option", {"sessionId": "s1", "configId": "model", "value": "model-c"})
     ]
+
+
+@pytest.mark.asyncio
+async def test_model_reset_without_configured_default_restores_initial_agent_model() -> None:
+    """A launch override does not become the fallback when the agent owns its default."""
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", model="model-b", default_model="", omnigent_mcp=False)
+    )
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        if method == "session/new":
+            return {
+                "result": {
+                    "sessionId": "s1",
+                    "configOptions": [
+                        {"id": "model", "currentValue": "model-a"},
+                    ],
+                }
+            }
+        return {
+            "result": {
+                "configOptions": [
+                    {"id": "model", "currentValue": params["value"]},
+                ]
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    session_id = await ex._ensure_session()
+    await ex._apply_model_override(session_id, "model-b")
+    await ex._apply_model_override(session_id, None)
+
+    assert [
+        params["value"] for method, params in calls if method == "session/set_config_option"
+    ] == [
+        "model-b",
+        "model-a",
+    ]
+    assert ex._active_model == "model-a"

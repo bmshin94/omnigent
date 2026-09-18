@@ -227,9 +227,8 @@ class AcpAgentConfig:
         plain user content and lets the agent's own system prompt take effect
         unmodified. When ``omnigent_mcp`` is ``False`` and the agent manages its
         own context, setting this to ``False`` is strongly recommended.
-    :param available_models: Curated model ids the deployment verified for this
-        agent (``HARNESS_ACP_MODEL_LIST`` — launch model first, then the
-        provider's ``models:`` maps). Empty (the default) means nothing was
+    :param available_models: Curated model ids from the agent's explicitly bound
+        provider (``HARNESS_ACP_MODEL_LIST``). Empty (the default) means nothing was
         curated: every model the agent accepts is allowed. When set, warm
         ``session/set_config_option`` switches to ids outside the list are
         withheld — the ACP counterpart of pi-native's ``enabledModels`` scoping
@@ -242,6 +241,9 @@ class AcpAgentConfig:
         curated set. Applied on top of the deny-by-default allowlist, so a name
         can be both passed through and later removed deliberately. Empty (the
         default) means no scrubbing.
+    :param default_model: Model to restore when a per-turn override is cleared.
+        ``None`` preserves the launch-model fallback; an empty string uses the
+        model originally reported by the ACP session.
     """
 
     command: str
@@ -255,6 +257,7 @@ class AcpAgentConfig:
     inject_system_prompt: bool = True
     available_models: tuple[str, ...] = ()
     env_unset: tuple[str, ...] = ()
+    default_model: str | None = None
 
 
 class _AcpRequestError(Exception):
@@ -413,6 +416,7 @@ class AcpExecutor(Executor):
         # and the live model value, both learned from ``config_option_update``.
         self._config_option_ids: set[str] = set()
         self._active_model: str | None = None
+        self._initial_model: str | None = None
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
         self._model_switch_supported: bool = True
@@ -878,6 +882,7 @@ class AcpExecutor(Executor):
         if isinstance(result, dict):
             self._note_config_options(result.get("configOptions"))
             self._note_session_models(result.get("models"))
+        self._initial_model = self._active_model
         return self._session_id
 
     def _note_session_models(self, models: object) -> None:
@@ -1439,6 +1444,7 @@ class AcpExecutor(Executor):
     def _reset_session_state(self) -> None:
         """Forget state that is only valid for the current ACP session."""
         self._session_id = None
+        self._initial_model = None
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
@@ -1585,12 +1591,15 @@ class AcpExecutor(Executor):
         has.
 
         :param session_id: The live ACP session to reconfigure.
-        :param model: Requested model id, or ``None`` to leave it alone.
+        :param model: Requested model id, or ``None`` to restore the configured default.
         """
-        # A turn carries a model only when the user picked one; fall back to the
-        # agent's configured ``model:`` so a configured id is actually applied
-        # instead of leaving the agent on its own default.
-        model = model or self._config.model
+        # A launch override must not replace the default restored by later turns.
+        default_model = self._config.default_model
+        if default_model is None:
+            default_model = self._config.model
+        elif not default_model:
+            default_model = self._initial_model
+        model = model or default_model
         if not model or model == self._active_model or not self._model_switch_supported:
             return
         # Curated deployments only: a pick outside the verified set is withheld

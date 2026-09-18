@@ -1675,7 +1675,11 @@ def _build_acp_spawn_env(
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
     # Also lazy: model_catalog pulls the onboarding provider config eagerly.
-    from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
+    from omnigent.models.model_catalog import (
+        _acp_launch_model,
+        acp_curated_models,
+        validate_acp_model,
+    )
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
         acp_agents,
@@ -1743,26 +1747,16 @@ def _build_acp_spawn_env(
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
 
-        # Spec model, else the embedded/configured agent's model, else the
-        # provider's ``models["default"]`` tier — the same precedence the picker
-        # catalog resolves (see _acp_launch_model), so the launch model and the
-        # picker's default row can never disagree.
         model = _acp_launch_model(spec)
-        if model is not None and not model.startswith(("databricks-", "databricks/")):
+        validate_acp_model(spec, model)
+        if model is not None:
             env["HARNESS_ACP_MODEL"] = model
     # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
     # raises a clear request-time error pointing the user at `omnigent setup`.
 
-    # Curated model shortlist (launch model + the resolved provider's
-    # ``models:`` maps). The executor advertises these to the picker surface
-    # and withholds warm switches to models outside the curated set, mirroring
-    # pi-native's ``enabledModels`` scoping. Purely additive: an uncurated
-    # deployment (no providers:/models: config) forwards nothing.
+    # The approved catalog is independent of the selected model.
     curated = acp_curated_models(spec)
-    if len(curated) > 1:
-        # Forward only a real curated set: a single-entry list would gate
-        # warm switches to just the launch model all over again (uncurated
-        # deployments must keep the agent's own any-model picker behaviour).
+    if curated:
         env["HARNESS_ACP_MODEL_LIST"] = ",".join(curated)
 
     # Credential vars the operator declared off-limits for generic ACP agents.

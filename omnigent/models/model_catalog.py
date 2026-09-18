@@ -77,7 +77,6 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
-    from omnigent.onboarding.provider_config import FamilyConfig
     from omnigent.onboarding.providers import ModelInfo
     from omnigent.spec.types import AgentSpec
 
@@ -630,9 +629,11 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
 
     agent_spec = cast("AgentSpec", spec)
-    # ``acp`` (family-agnostic, like pi) is not a workflow AgentHarnessType —
-    # routing it through the same resolver is deliberate: see acp_curated_models.
-    entry = _resolve_provider_for_build(agent_spec, harness_type=cast(Any, harness_type))
+    entry = (
+        _acp_provider_entry(agent_spec)
+        if harness_type == "acp"
+        else _resolve_provider_for_build(agent_spec, harness_type=harness_type)
+    )
     if entry is not None:
         return _provider_from_entry(entry, harness_type)
     return _provider_from_legacy_auth(agent_spec, harness_type)
@@ -833,13 +834,14 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
     """The model an ACP worker launches with, mirroring the spawn builder.
 
     :param spec: The worker's (sub-)agent spec.
-    :returns: The spec model (unless a ``databricks-`` id, which the builder
-        drops), else the embedded/configured agent's model, else the resolved
-        provider's ``models["default"]`` tier, else ``None``.
+    :returns: The spec model, else the embedded/configured agent's model,
+        else the explicitly selected provider's default. Uncurated sessions
+        retain the legacy filtering of inherited Databricks spec models.
     """
     model = getattr(spec.executor, "model", None)
-    if isinstance(model, str) and model and not model.startswith(("databricks-", "databricks/")):
-        return model
+    if isinstance(model, str) and model:
+        if not model.startswith(("databricks-", "databricks/")) or acp_curated_models(spec):
+            return model
     # Imported lazily: the onboarding config read should stay off the
     # listing hot path (mirrors the cursor builder's own lazy read).
     from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
@@ -850,103 +852,102 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
         embedded_model = embedded.get("model") if isinstance(embedded, dict) else None
         if isinstance(embedded_model, str) and embedded_model:
             return embedded_model
-        return None
-    raw_harness = str(cfg.get("harness") or "") if isinstance(cfg, dict) else ""
-    slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
-    agent = resolve_acp_agent(slug) if slug else None
-    if agent is None:
-        agents = acp_agents()
-        agent = agents[0] if agents else None
-    if agent is not None and agent.model:
-        return agent.model
-    # Deployment-curated default: the resolved provider's ``models["default"]``
-    # tier is the launch model when neither the spec nor the agent pins one,
-    # exactly as the gateway deployments curate for pi-native.
+    else:
+        raw_harness = str(cfg.get("harness") or "") if isinstance(cfg, dict) else ""
+        slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
+        agent = resolve_acp_agent(slug) if slug else None
+        if agent is None:
+            agents = acp_agents()
+            agent = agents[0] if agents else None
+        if agent is not None and agent.model:
+            return agent.model
     try:
-        from omnigent.runtime.workflow import _resolve_provider_for_build
-
-        entry = _resolve_provider_for_build(spec, harness_type=cast(Any, "acp"))
+        entry = _acp_provider_entry(spec)
         if entry is not None:
-            for family_name in entry.families:
-                default_model = entry.family_default_model(family_name)
-                if default_model:
-                    family = entry.families.get(family_name)
-                    if family is not None:
-                        default_model = _resolve_model_tier_alias(family, default_model)
-                    return default_model
+            return _acp_provider_default(entry) or next(iter(acp_curated_models(spec)), None)
+        return None
     except Exception:  # noqa: BLE001
         return None
-    return None
 
 
-def _resolve_model_tier_alias(family: FamilyConfig, model_id: str) -> str:
-    """Resolve a ``models:`` value naming another tier to its concrete id.
+def _acp_provider_entry(spec: AgentSpec) -> ProviderEntry | None:
+    """Resolve only a provider explicitly selected for this ACP agent.
 
-    Deployments alias tier names to ids (``deepseek-pro: deepseek-v4-pro``)
-    and reference those aliases from other tiers (``default: deepseek-pro``).
-    Whatever reaches the gateway, the spawn env, and the picker must be the
-    concrete id, never the alias.
+    :param spec: The worker's agent spec.
+    :returns: The named provider, or ``None`` when the vendor owns its config.
     """
-    current = model_id
-    for _ in range(8):  # bounded: a cyclic alias map must terminate
-        alias = family.models.get(current)
-        if not isinstance(alias, str) or not alias or alias == current:
-            return current
-        current = alias
-    return model_id
+    from omnigent.runtime.workflow import _resolve_provider_for_build
+    from omnigent.spec.types import ProviderAuth
+
+    if not isinstance(spec.executor.auth, ProviderAuth):
+        return None
+    return _resolve_provider_for_build(spec, harness_type=cast(Any, "acp"))
+
+
+def _acp_provider_default(entry: ProviderEntry) -> str | None:
+    """Return the first configured provider default with tier aliases resolved.
+
+    :param entry: The provider explicitly selected for an ACP agent.
+    :returns: The concrete default model id, or ``None``.
+    """
+    for family in entry.families.values():
+        if family.default_model:
+            return family.resolve_model_tier(family.default_model)
+    return None
 
 
 def acp_curated_models(spec: object) -> tuple[str, ...]:
     """Curated model shortlist for a generic-ACP worker's picker.
 
-    The launch model first (the :func:`_acp_launch_model` selection — always
-    present when a model is known, so the picker never hides the active
-    model), then the union of every family ``models:`` tier map on the
-    resolved provider entry in config order, deduplicated. Tier values that
-    name another tier resolve to their concrete id first, so aliases never
-    leak into the list. This is the ACP
-    counterpart of pi-native's curated ``extra_models``: the deployment's
-    verified set, not a live vendor catalog.
-
-    Resolution is strict (no ambient fallback synthesis): the spec's named
-    ``executor.auth`` provider wins, then the configured default for an
-    unmapped harness (pi-style surface fallback). Credentials are not
-    consulted — the vendor CLI authenticates itself; only the ``models:``
-    maps are read, so a curated readout never fails on a missing key.
+    Only an explicitly selected ``executor.auth`` provider supplies models.
+    Its default leads, followed by the family ``models:`` values in config
+    order, deduplicated after resolving aliases. Session overrides and ACP
+    agent defaults never expand or reorder the deployment's configured set.
+    Credentials are not consulted: the vendor CLI authenticates itself.
 
     Total by contract: any resolution error collapses to ``()`` so spawn-env
     and picker callers can treat an empty list as "nothing curated".
 
     :param spec: The worker's (sub-)agent spec.
-    :returns: Deduplicated model ids, launch model first; empty when no
-        provider or no ``models:`` map is configured.
+    :returns: At least two distinct configured model ids, provider default
+        first; empty for unbound, unconfigured, or default-only providers.
     """
-    launch = None
-    curated: list[str] = []
     try:
-        agent_spec = cast("AgentSpec", spec)
-        launch = _acp_launch_model(agent_spec)
-        from omnigent.runtime.workflow import _resolve_provider_for_build
-
-        # The generic acp harness is not a workflow AgentHarnessType (it
-        # carries no gateway env of its own), but resolution for an unmapped
-        # harness is family-agnostic, which is exactly acp's semantics.
-        entry = _resolve_provider_for_build(agent_spec, harness_type=cast(Any, "acp"))
-        if entry is not None:
-            for family_config in entry.families.values():
-                for model_id in family_config.models.values():
-                    if isinstance(model_id, str) and model_id:
-                        curated.append(_resolve_model_tier_alias(family_config, model_id))
+        entry = _acp_provider_entry(cast("AgentSpec", spec))
+        if entry is None:
+            return ()
+        default = _acp_provider_default(entry)
+        models = [default] if default else []
+        models.extend(
+            family.resolve_model_tier(model_id)
+            for family in entry.families.values()
+            for model_id in family.models.values()
+            if model_id
+        )
+        curated = tuple(dict.fromkeys(models))
+        return curated if len(curated) > 1 else ()
     except Exception:  # noqa: BLE001
         return ()
-    ids: list[str] = []
-    seen: set[str] = set()
-    for model_id in (launch, *curated):
-        if not model_id or model_id in seen:
-            continue
-        seen.add(model_id)
-        ids.append(model_id)
-    return tuple(ids)
+
+
+def validate_acp_model(spec: object, model: str | None) -> None:
+    """Reject a requested model outside the ACP agent's configured shortlist.
+
+    :param spec: The worker's (sub-)agent spec.
+    :param model: Requested model id, or ``None`` to reset to the default.
+    :raises OmnigentError: If a curated provider does not include the model.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    if model is None:
+        return
+    curated = acp_curated_models(spec)
+    if curated and model not in curated:
+        raise OmnigentError(
+            f"Model {model!r} is not in this ACP agent's configured model list. "
+            "Choose a listed model or add it to the provider's models configuration.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedModelProvider:

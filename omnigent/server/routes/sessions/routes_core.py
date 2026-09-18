@@ -169,8 +169,10 @@ from omnigent.server.routes._sessions.orchestration import (
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
+    _load_acp_model_options,
     _persist_model_change_note,
     _publish_runner_recovered_status,
+    _resolve_harness_impl_is_acp,
     _run_managed_launch,
     _spawn_archive_stop,
 )
@@ -2247,6 +2249,18 @@ def register_core_routes(
                     f"invalid model_override: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+            conv_for_model = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if conv_for_model is None:
+                raise _session_not_found()
+            if await asyncio.to_thread(_resolve_harness_impl_is_acp, conv_for_model, agent_store):
+                options = await _load_acp_model_options(session_id, conv_for_model, agent_store)
+                if options and model_override not in {option["id"] for option in options}:
+                    raise OmnigentError(
+                        f"Model {model_override!r} is not in the ACP provider's curated models",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,

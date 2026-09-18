@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
@@ -159,3 +160,21 @@ def test_acp_session_model_override_selection_persists(
         page.locator('[role="menuitemcheckbox"][data-model-id="gemini-3-8-flash"]').click()
 
     assert patch_bodies[-1] == {"model_override": "gemini-3-8-flash"}
+
+
+@pytest.mark.parametrize("model_options", [[], _ACP_MODEL_OPTIONS[:1]])
+def test_acp_session_without_shortlist_hides_model_picker(
+    page: Page,
+    seeded_session: tuple[str, str],
+    model_options: list[dict],
+) -> None:
+    """An uncurated ACP session has no model control to suggest it can switch."""
+    base_url, session_id = seeded_session
+    _patch_session_as_acp(page, session_id, model_options=model_options)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    expect(gear).to_be_disabled()
+    expect(page.get_by_test_id("composer-agent-edit")).to_have_count(0)

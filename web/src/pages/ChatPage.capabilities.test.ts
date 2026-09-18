@@ -93,11 +93,17 @@ describe("shouldShowModelPicker", () => {
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(true);
   });
 
-  it("shows the picker for generic ACP sessions via the canonical harness field", () => {
-    // WHY: ACP sessions carry no wrapper label; the server canonicalizes
-    // acp:<slug> ids to "acp" in the snapshot's harness field, which is the
-    // session's only picker-family evidence.
-    expect(shouldShowModelPicker({ labels: {}, harness: "acp" })).toBe(true);
+  it("shows the picker for generic ACP sessions with a curated catalog", () => {
+    const catalog = [{ id: "gpt-5.4" }, { id: "claude-fable-5" }];
+    expect(shouldShowModelPicker({ labels: {}, harness: "acp" }, catalog)).toBe(true);
+    expect(modelPickerKindForConv({ labels: {}, harness: "acp" }, catalog)).toBe("acp");
+  });
+
+  it("hides the ACP picker until there are models to choose between", () => {
+    const conv = { labels: {}, harness: "acp" };
+    expect(shouldShowModelPicker(conv)).toBe(false);
+    expect(shouldShowModelPicker(conv, [])).toBe(false);
+    expect(shouldShowModelPicker(conv, [{ id: "gpt-5.4" }])).toBe(false);
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {

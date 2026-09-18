@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from omnigent.entities.conversation import Conversation
+from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.server.routes._sessions import orchestration as orch
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +84,7 @@ async def test_load_acp_model_options_caches_and_serves() -> None:
         patch.object(orch, "_load_agent_spec_for_session", return_value=MagicMock()) as mock_load,
         patch.object(orch, "_publish_model_options", return_value=None) as mock_publish,
         patch("omnigent.models.model_catalog.acp_curated_models", return_value=curated),
+        patch("omnigent.models.model_catalog._acp_launch_model", return_value=curated[0]),
     ):
         options = await orch._load_acp_model_options("conv_acp", conv, MagicMock())
         assert options == [
@@ -95,13 +101,98 @@ async def test_load_acp_model_options_caches_and_serves() -> None:
 
 
 @pytest.mark.asyncio
-async def test_load_acp_model_options_returns_empty_when_uncurated() -> None:
-    """Fewer than two curated ids → no picker (nothing to pick between)."""
+@pytest.mark.parametrize("curated", [(), ("only-model",)])
+async def test_load_acp_model_options_caches_empty_catalog(curated: tuple[str, ...]) -> None:
+    """An uncurated session does not reread configuration on every snapshot."""
     conv = _conv()
 
     with (
-        patch.object(orch, "_load_agent_spec_for_session", return_value=MagicMock()),
-        patch("omnigent.models.model_catalog.acp_curated_models", return_value=("only-model",)),
+        patch.object(orch, "_load_agent_spec_for_session", return_value=MagicMock()) as mock_load,
+        patch("omnigent.models.model_catalog.acp_curated_models", return_value=curated) as resolve,
+        patch.object(orch, "_publish_model_options"),
     ):
-        result = await orch._load_acp_model_options("conv_acp", conv, MagicMock())
-        assert result == []
+        assert await orch._load_acp_model_options("conv_acp", conv, MagicMock()) == []
+        assert await orch._load_acp_model_options("conv_acp", conv, MagicMock()) == []
+        assert orch._model_options_cache["conv_acp"] == []
+        mock_load.assert_called_once()
+        resolve.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_load_acp_model_options_resolves_provider_off_event_loop() -> None:
+    """Provider configuration I/O must not block unrelated session requests."""
+    event_loop_thread = threading.get_ident()
+    resolver_threads: list[int] = []
+
+    def resolve(_spec: object) -> tuple[str, ...]:
+        resolver_threads.append(threading.get_ident())
+        return ("gpt-5.4", "claude-fable-5")
+
+    def default_model(_spec: object) -> str:
+        resolver_threads.append(threading.get_ident())
+        return "gpt-5.4"
+
+    with (
+        patch.object(orch, "_load_agent_spec_for_session", return_value=MagicMock()),
+        patch("omnigent.models.model_catalog.acp_curated_models", side_effect=resolve),
+        patch("omnigent.models.model_catalog._acp_launch_model", side_effect=default_model),
+        patch.object(orch, "_publish_model_options"),
+    ):
+        await orch._load_acp_model_options("conv_acp", _conv(), MagicMock())
+
+    assert len(resolver_threads) == 2
+    assert all(thread != event_loop_thread for thread in resolver_threads)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("default_source", ["spec", "agent"])
+async def test_acp_picker_default_matches_runtime_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    default_source: str,
+) -> None:
+    """The provider's first row need not be the model restored on reset."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "gateway": {
+                        "kind": "gateway",
+                        "openai": {
+                            "base_url": "https://gateway.example/v1",
+                            "api_key": "synthetic",
+                            "models": {"default": "model-a", "small": "model-b"},
+                        },
+                    }
+                }
+            }
+        )
+    )
+    agent = {"name": "Test", "command": "fake-cli"}
+    if default_source == "agent":
+        agent["model"] = "model-b"
+    spec = AgentSpec(
+        spec_version=1,
+        name="test-acp",
+        executor=ExecutorSpec(
+            type="omnigent",
+            model="model-b" if default_source == "spec" else None,
+            auth=ProviderAuth(name="gateway"),
+            config={"harness": "acp", "acp_agent": agent},
+        ),
+    )
+    conv = _conv(harness_override="acp", model_override="model-a")
+    with (
+        patch.object(orch, "_load_agent_spec_for_session", return_value=spec),
+        patch.object(orch, "_publish_model_options"),
+    ):
+        options = await orch._load_acp_model_options(conv.id, conv, MagicMock())
+    spawn_env = _build_spawn_env_from_spec(spec, "acp", model_override="model-a")
+
+    assert options == [
+        {"id": "model-a", "displayName": "model-a", "isDefault": False},
+        {"id": "model-b", "displayName": "model-b", "isDefault": True},
+    ]
+    assert spawn_env is not None
+    assert spawn_env["HARNESS_ACP_DEFAULT_MODEL"] == "model-b"

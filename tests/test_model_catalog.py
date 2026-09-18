@@ -49,7 +49,7 @@ from omnigent.models.model_metadata import (
 from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
-from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
 
 
 @pytest.fixture(autouse=True)
@@ -1908,28 +1908,24 @@ _GATEWAY_WITH_MODELS = (
 )
 
 
-def test_acp_curated_models_launch_first_deduped_config_order(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("model", [None, "gpt-5.4", "outside-configured-list"])
+def test_acp_curated_models_independent_of_session_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None
 ) -> None:
-    """The launch model leads; the family models: maps union in config order.
-
-    The acp picker must always show the active model (never hide it), and
-    duplicate ids collapse so a tier map repeating the default does not
-    double-list the id.
-    """
+    """A session override cannot expand or reorder the configured shortlist."""
     _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
-    spec = _worker_spec("acp:custom", model="gpt-5.4")
+    spec = _worker_spec("acp:custom", model=model, auth=ProviderAuth(name="bifrost"))
     assert model_catalog.acp_curated_models(spec) == (
-        "gpt-5.4",
         "claude-fable-5",
         "claude-opus-x",
+        "gpt-5.4",
     )
 
 
-def test_acp_curated_models_without_models_map_keeps_launch_only(
+def test_acp_curated_models_without_models_map_is_unrestricted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No models: map yields just the launch model (nothing was curated)."""
+    """Selecting a provider without model curation leaves overrides unrestricted."""
     _isolate_config(
         monkeypatch,
         tmp_path,
@@ -1941,8 +1937,9 @@ def test_acp_curated_models_without_models_map_keeps_launch_only(
         "      base_url: https://gw.example.com/anthropic\n"
         "      api_key: sk-anthropic\n",
     )
-    spec = _worker_spec("acp:custom", model="claude-x")
-    assert model_catalog.acp_curated_models(spec) == ("claude-x",)
+    spec = _worker_spec("acp:custom", model="claude-x", auth=ProviderAuth(name="bifrost"))
+    assert model_catalog.acp_curated_models(spec) == ()
+    model_catalog.validate_acp_model(spec, "another-model")
 
 
 def test_acp_curated_models_provider_default_leads_when_unpinned(
@@ -1956,7 +1953,7 @@ def test_acp_curated_models_provider_default_leads_when_unpinned(
     falling back to raw config order.
     """
     _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
-    spec = _worker_spec("acp:custom")
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
     assert model_catalog.acp_curated_models(spec) == (
         "claude-fable-5",
         "claude-opus-x",
@@ -1986,15 +1983,16 @@ def test_acp_curated_models_default_alias_resolves_to_concrete_id(
         "      api_key: sk-openai\n"
         "      wire_api: chat\n"
         "      models:\n"
-        "        default: deepseek-pro\n"
+        "        gemma: gemma-4-31B-it\n"
         "        deepseek-pro: deepseek-v4-pro\n"
-        "        gemma: gemma-4-31B-it\n",
+        "        default: deepseek-pro\n",
     )
-    spec = _worker_spec("acp:custom")
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
     assert model_catalog.acp_curated_models(spec) == (
         "deepseek-v4-pro",
         "gemma-4-31B-it",
     )
+    assert model_catalog._acp_launch_model(spec) == "deepseek-v4-pro"
 
 
 def test_acp_curated_models_empty_without_provider_or_model(
@@ -2011,7 +2009,8 @@ def test_resolve_provider_acp_slug_canonicalizes_and_prefers_anthropic(
     """``acp:<slug>`` resolves like ``acp``: family-agnostic, anthropic first."""
     _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
     provider = resolve_model_provider(
-        _worker_spec("acp:whatever", model="claude-fable-5"), "acp:whatever"
+        _worker_spec("acp:whatever", model="claude-fable-5", auth=ProviderAuth(name="bifrost")),
+        "acp:whatever",
     )
     assert provider.kind == "gateway"
     assert provider.family == "anthropic"
@@ -2024,3 +2023,121 @@ def test_resolve_provider_acp_reports_none_when_unconfigured(
     _isolate_config(monkeypatch, tmp_path, "")
     provider = resolve_model_provider(_worker_spec("acp"), "acp")
     assert provider.kind == "none"
+
+
+@pytest.mark.parametrize("model", [None, "gemini-2.5-pro"])
+def test_acp_ignores_unrelated_global_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None
+) -> None:
+    """A default provider for other harnesses cannot configure a vendor-owned ACP agent."""
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:gemini", model=model)
+    assert model_catalog._acp_launch_model(spec) == model
+    assert model_catalog.acp_curated_models(spec) == ()
+    assert resolve_model_provider(spec, "acp:gemini").kind == "none"
+    model_catalog.validate_acp_model(spec, "another-gemini-model")
+
+
+@pytest.mark.parametrize(
+    "models_yaml",
+    [
+        "        default: gpt-5\n",
+        "        default: primary\n        primary: gpt-5\n        fast: gpt-5\n",
+    ],
+)
+def test_acp_default_only_provider_does_not_restrict_model_selection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, models_yaml: str
+) -> None:
+    """One distinct configured model is a default, even when multiple aliases name it."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gateway:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.com/v1\n"
+        "      api_key: fake-key\n"
+        "      models:\n" + models_yaml,
+    )
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="gateway"))
+    assert model_catalog._acp_launch_model(spec) == "gpt-5"
+    assert model_catalog.acp_curated_models(spec) == ()
+    spec.executor.model = "another-model"
+    assert model_catalog.acp_curated_models(spec) == ()
+    model_catalog.validate_acp_model(spec, "another-model")
+
+
+def test_embedded_acp_agent_uses_explicit_provider_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An embedded agent without a model uses its selected provider's default."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        _GATEWAY_WITH_MODELS + "acp:\n"
+        "  agents:\n"
+        "    - name: Other agent\n"
+        "      command: other-agent\n"
+        "      model: unrelated-model\n",
+    )
+    spec = _worker_spec("acp:embedded", auth=ProviderAuth(name="bifrost"))
+    spec.executor.config["acp_agent"] = {"name": "Embedded", "command": "custom-acp"}
+    assert model_catalog._acp_launch_model(spec) == "claude-fable-5"
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+@pytest.mark.parametrize("model", ["databricks-custom", "databricks/custom"])
+def test_explicit_acp_agent_databricks_model_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, embedded: bool, model: str
+) -> None:
+    """An agent's explicit model is a vendor-local id, regardless of its prefix."""
+    config = (
+        f"acp:\n  agents:\n    - name: Custom\n      command: custom-acp\n      model: {model}\n"
+    )
+    _isolate_config(monkeypatch, tmp_path, config)
+    spec = _worker_spec("acp:custom", model="databricks-inherited")
+    if embedded:
+        spec.executor.config["acp_agent"] = {
+            "name": "Embedded",
+            "command": "embedded-acp",
+            "model": model,
+        }
+    assert model_catalog._acp_launch_model(spec) == model
+
+
+def test_acp_curated_databricks_spec_model_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Curated provider ids retain their Databricks prefix through launch selection."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        _GATEWAY_WITH_MODELS.replace("claude-opus-x", "databricks-custom"),
+    )
+    spec = _worker_spec("acp:custom", model="databricks-custom", auth=ProviderAuth(name="bifrost"))
+    assert model_catalog._acp_launch_model(spec) == "databricks-custom"
+    model_catalog.validate_acp_model(spec, "databricks-custom")
+
+
+def test_acp_curated_models_do_not_include_agent_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An agent default outside the provider set cannot silently expand its policy."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    _isolate_config(monkeypatch, tmp_path, _GATEWAY_WITH_MODELS)
+    spec = _worker_spec("acp:custom", auth=ProviderAuth(name="bifrost"))
+    spec.executor.config["acp_agent"] = {
+        "name": "Custom",
+        "command": "custom-acp",
+        "model": "outside-configured-list",
+    }
+    launch = model_catalog._acp_launch_model(spec)
+    assert launch == "outside-configured-list"
+    assert launch not in model_catalog.acp_curated_models(spec)
+    with pytest.raises(OmnigentError, match="configured model list") as error:
+        model_catalog.validate_acp_model(spec, launch)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+    model_catalog.validate_acp_model(spec, "gpt-5.4")
+    model_catalog.validate_acp_model(spec, None)

@@ -8998,6 +8998,27 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    if model_override is not None and agent_cache is not None:
+        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.models.model_catalog import validate_acp_model
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        selection_spec = (
+            await asyncio.to_thread(
+                agent_cache.load,
+                agent.id,
+                agent.bundle_location,
+                expand_env=agent.session_id is None,
+            )
+        ).spec
+        if body.sub_agent_name:
+            selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
+        if (
+            selection_spec is not None
+            and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
+        ):
+            await asyncio.to_thread(validate_acp_model, selection_spec, model_override)
+
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
@@ -10118,7 +10139,7 @@ async def _fetch_model_options(
       session slept), the session's host resolves a pre-launch preview
       instead — the same source the new-session picker uses.
     * **acp** — the deployment's curated provider ``models:`` shortlist from
-      the session's spec (launch model first). Static and local to the
+      the session's explicit provider (provider default first). Local to the
       server, so a cold cache re-resolves inline with no runner round trip.
       Served only when the deployment actually curated a set (2+ models); a
       session configured without one shows no picker, matching pi-native's
@@ -10252,19 +10273,13 @@ async def _load_acp_model_options(
 ) -> list[dict[str, Any]]:
     """Resolve the curated picker options for a generic ACP session.
 
-    Serves the deployment's verified shortlist from the session's own spec —
-    the launch model first, then the resolved provider's ``models:`` tier
-    maps (see :func:`omnigent.models.model_catalog.acp_curated_models`). The
-    catalog is static over a session's life (provider curation is resolved
-    from spec + deployment config), so it fills the standard
-    :data:`_model_options_cache` once and stays served while the session
-    sleeps, mirroring claude-native's offline contract without needing a
-    runner round trip.
+    Serves the explicitly selected provider's verified shortlist in provider
+    order. The default row restores the agent's configured launch model.
+    The resolved options, including an empty catalog, stay cached while the
+    session sleeps without needing a runner round trip. Spec and provider
+    configuration reads run off the event loop.
 
-    A session whose deployment curated nothing (fewer than two models, or no
-    provider ``models:`` map at all) returns ``[]`` — the picker simply does
-    not render, matching pi-native's rule that an uncurated deployment keeps
-    its default picker behaviour.
+    Fewer than two curated models returns ``[]`` so the picker does not render.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param conv: Conversation row the options are resolved for.
@@ -10297,18 +10312,19 @@ async def _load_acp_model_options(
             from types import SimpleNamespace
 
             resolved_spec = SimpleNamespace(executor=sub.executor)
-    from omnigent.models.model_catalog import acp_curated_models
+    from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
 
-    curated = acp_curated_models(resolved_spec)
-    if len(curated) < 2:
-        # Nothing was curated (or the launch model is the whole set): with
-        # one model there is nothing to pick between. Return without caching
-        # so a later deployment config change populates the picker.
-        return []
-    options = [
-        {"id": model_id, "displayName": model_id, "isDefault": index == 0}
-        for index, model_id in enumerate(curated)
-    ]
+    def resolve_options() -> list[dict[str, Any]]:
+        curated = acp_curated_models(resolved_spec)
+        if len(curated) < 2:
+            return []
+        default_model = _acp_launch_model(cast(AgentSpec, resolved_spec))
+        return [
+            {"id": model_id, "displayName": model_id, "isDefault": model_id == default_model}
+            for model_id in curated
+        ]
+
+    options = await asyncio.to_thread(resolve_options)
     _model_options_cache[session_id] = options
     _model_options_stale.discard(session_id)
     _publish_model_options(session_id)

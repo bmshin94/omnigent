@@ -22,9 +22,10 @@ Env vars read at startup:
 - ``HARNESS_ACP_NAME``: display label for logs / elicitation cards.
 - ``HARNESS_ACP_MODEL``: optional model id (only sent when the agent is
   configured to accept one in ``session/new``).
-- ``HARNESS_ACP_MODEL_LIST``: comma-separated curated model ids the deployment
-  verified for this agent (the launch model first, then the resolved
-  provider's ``models:`` maps). When set, warm model switches to ids outside
+- ``HARNESS_ACP_DEFAULT_MODEL``: model restored when an override is cleared.
+  Empty uses the ACP session's initial model; unset uses the launch model.
+- ``HARNESS_ACP_MODEL_LIST``: comma-separated curated model ids from the agent's
+  explicitly bound provider. When set, warm model switches to ids outside
   the list are withheld; unset means any model the agent accepts.
 - ``HARNESS_ACP_ENV_UNSET``: comma-separated environment variable *names* to
   strip from the spawn env handed to the vendor CLI (operator-declared, e.g.
@@ -73,6 +74,7 @@ _logger = logging.getLogger(__name__)
 _ENV_COMMAND = "HARNESS_ACP_COMMAND"
 _ENV_NAME = "HARNESS_ACP_NAME"
 _ENV_MODEL = "HARNESS_ACP_MODEL"
+_ENV_DEFAULT_MODEL = "HARNESS_ACP_DEFAULT_MODEL"
 _ENV_MODEL_LIST = "HARNESS_ACP_MODEL_LIST"
 _ENV_ENV_UNSET = "HARNESS_ACP_ENV_UNSET"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
@@ -173,6 +175,7 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
         command=command,
         name=name,
         model=model,
+        default_model=os.environ.get(_ENV_DEFAULT_MODEL),
         session_id_mode=session_id_mode,
         send_model_in_session_new=send_model,
         omnigent_mcp=omnigent_mcp,
