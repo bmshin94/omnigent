@@ -8,13 +8,18 @@ Covers ``omnigent.host.local_server``: reuse-vs-respawn detection
 
 from __future__ import annotations
 
+import json
+import subprocess
+import textwrap
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import click
 import httpx
 import pytest
 
+import omnigent
 from omnigent.host import local_server
 
 
@@ -350,6 +355,70 @@ def test_ensure_local_omnigent_server_spawns_when_none_healthy(
     # Ambient passthrough, no injection: the spawned server sees the
     # shell's own DATABRICKS_CONFIG_PROFILE, untouched.
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"
+
+
+def test_spawn_local_server_preserves_runtime_and_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The server retains the selected installation without importing from cwd."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    for name in ("PYTHONSAFEPATH", "PYTHONPATH", "OMNIGENT_DATABASE_URI"):
+        monkeypatch.delenv(name, raising=False)
+
+    with patch.object(local_server.subprocess, "Popen") as popen:
+        local_server._spawn_local_server(8765)
+    popen.assert_called_once()
+    args = popen.call_args.args[0]
+    kwargs = popen.call_args.kwargs
+    module_index = args.index("-m")
+    assert args[module_index + 1 : module_index + 3] == ["omnigent.cli", "server"]
+    # Exercise the captured interpreter options without starting a server
+    # or inheriting the developer's credentials.
+    probe_env = {
+        name: value
+        for name, value in kwargs["env"].items()
+        if name in {"PATH", "SYSTEMROOT", "WINDIR", "OMNIGENT_CONFIG_HOME", "OMNIGENT_DATA_DIR"}
+    }
+    probe_env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    probe = textwrap.dedent("""\
+        import json, os, sys
+
+        startup_path = list(sys.path)
+        import omnigent
+        from omnigent.config import global_config_path
+        from omnigent.host.local_server import _local_data_dir
+
+        print(json.dumps(dict(
+            safe_path=sys.flags.safe_path,
+            startup_path=startup_path,
+            cwd=os.getcwd(),
+            runtime=omnigent.__file__,
+            config=str(global_config_path()),
+            data=str(_local_data_dir()),
+        )))
+    """)
+    result = subprocess.run(
+        [*args[:module_index], "-c", probe],
+        cwd=kwargs.get("cwd"),
+        env=probe_env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    observed = json.loads(result.stdout)
+    assert "" not in observed["startup_path"]
+    assert workspace.resolve() not in {Path(entry).resolve() for entry in observed["startup_path"]}
+    assert observed["safe_path"] is True
+    assert Path(observed["runtime"]).resolve() == Path(omnigent.__file__).resolve()
+    assert Path(observed["cwd"]) == workspace.resolve()
+    assert Path(observed["config"]) == local_server.global_config_path()
+    assert Path(observed["data"]) == local_server._local_data_dir()
 
 
 def test_stop_local_omnigent_server_waits_for_process_exit(
